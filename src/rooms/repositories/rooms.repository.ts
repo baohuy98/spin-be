@@ -1,11 +1,19 @@
 import { Injectable } from '@nestjs/common';
 import { Room } from '../entities/room.entity';
 
+export interface LoggedInUser {
+  genID: string;
+  name: string;
+  roomId: string | null;
+  socketId: string;
+}
+
 @Injectable()
 export class RoomsRepository {
   private rooms: Map<string, Room> = new Map();
   private userSocketMap: Map<string, string> = new Map();
   private userRoomMap: Map<string, string> = new Map();
+  private loggedInUsers: Map<string, LoggedInUser> = new Map();
 
   // Room operations
   createRoom(room: Room): Room {
@@ -81,5 +89,51 @@ export class RoomsRepository {
       return true;
     }
     return false;
+  }
+
+  // Logged-in users operations
+  addLoggedInUser(genID: string, name: string, roomId: string | null, socketId: string): void {
+    this.loggedInUsers.set(genID, { genID, name, roomId, socketId });
+  }
+
+  getLoggedInUser(genID: string): LoggedInUser | undefined {
+    return this.loggedInUsers.get(genID);
+  }
+
+  isUserLoggedInToRoom(genID: string, roomId: string): boolean {
+    const user = this.loggedInUsers.get(genID);
+    return user !== undefined && user.roomId === roomId;
+  }
+
+  updateLoggedInUserRoom(genID: string, roomId: string | null): boolean {
+    const user = this.loggedInUsers.get(genID);
+    if (!user) {
+      return false;
+    }
+    user.roomId = roomId;
+    return true;
+  }
+
+  updateLoggedInUserSocket(genID: string, socketId: string): boolean {
+    const user = this.loggedInUsers.get(genID);
+    if (!user) {
+      return false;
+    }
+    user.socketId = socketId;
+    return true;
+  }
+
+  removeLoggedInUser(genID: string): boolean {
+    return this.loggedInUsers.delete(genID);
+  }
+
+  getAllLoggedInUsers(): LoggedInUser[] {
+    return Array.from(this.loggedInUsers.values());
+  }
+
+  getLoggedInUsersByRoom(roomId: string): LoggedInUser[] {
+    return Array.from(this.loggedInUsers.values()).filter(
+      user => user.roomId === roomId
+    );
   }
 }

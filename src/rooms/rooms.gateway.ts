@@ -68,6 +68,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         console.log(`Room deleted: ${roomId}`);
       }
     }
+
+    // Remove from logged-in users
+    this.roomsService.removeLoggedInUser(userId);
   }
 
   @SubscribeMessage('create-room')
@@ -75,9 +78,23 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: CreateRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
-    // Check if user is already in a room
+    // Check if host is already in a room
     const existingRoomId = this.roomsService.getUserRoom(data.hostId);
     if (existingRoomId) {
+      // Check if this is a different socket
+      const existingSocketId = this.roomsService.getUserSocket(data.hostId);
+      if (existingSocketId && existingSocketId !== client.id) {
+        console.log(`Disconnecting old socket ${existingSocketId} for host ${data.hostId}`);
+        // Disconnect the old socket
+        const oldSocket = this.server.sockets.sockets.get(existingSocketId);
+        if (oldSocket) {
+          oldSocket.emit('error', {
+            message: 'You have been disconnected because this account was opened in another tab/window.'
+          });
+          oldSocket.disconnect(true);
+        }
+      }
+
       // Leave the existing room first
       const result = this.roomsService.leaveRoom(existingRoomId, data.hostId);
       if (result) {
@@ -93,17 +110,35 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
 
     const room = this.roomsService.createRoom(data.hostId);
+    const isRejoining = room.members.length > 1; // More than just host means existing viewers
+
     this.roomsService.setUserSocket(data.hostId, client.id);
     this.roomsService.setUserRoom(data.hostId, room.roomId);
+
+    // Add host to logged-in users array
+    this.roomsService.addLoggedInUser(data.hostId, data.name, room.roomId, client.id);
+
     void client.join(room.roomId);
 
-    console.log(`Room created: ${room.roomId} by ${data.hostId}`);
+    console.log(`Room created: ${room.roomId} by ${data.hostId} (${data.name})`);
+
+    const membersWithDetails = this.roomsService.getRoomMembersWithDetails(room.roomId);
 
     client.emit('room-created', {
       roomId: room.roomId,
       hostId: room.hostId,
       members: room.members,
+      membersWithDetails,
     });
+
+    // If host is rejoining with existing viewers, notify them to reset WebRTC
+    if (isRejoining) {
+      console.log(`Host rejoined room ${room.roomId} with existing viewers, notifying them`);
+      client.to(room.roomId).emit('host-reconnected', {
+        hostId: data.hostId,
+        hostSocketId: client.id,
+      });
+    }
   }
 
   @SubscribeMessage('validate-room')
@@ -128,6 +163,42 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
 
+    // Check if user is logged in to this specific room already
+    const isLoggedInToRoom = this.roomsService.isUserLoggedInToRoom(data.memberId, data.roomId);
+
+    if (isLoggedInToRoom) {
+      console.log(`${data.memberId} (${data.name}) is already logged into room ${data.roomId}`);
+
+      // Check if this is a different socket (page reload scenario)
+      const existingSocketId = this.roomsService.getUserSocket(data.memberId);
+      if (existingSocketId && existingSocketId !== client.id) {
+        console.log(`Kicking old session for ${data.memberId}, allowing new session`);
+        // Disconnect the old socket
+        const oldSocket = this.server.sockets.sockets.get(existingSocketId);
+        if (oldSocket) {
+          oldSocket.emit('error', {
+            message: 'You have been disconnected because this account was opened in another tab/window.'
+          });
+          oldSocket.disconnect(true);
+        }
+
+        // Update the socket mapping to the new connection
+        this.roomsService.setUserSocket(data.memberId, client.id);
+        this.roomsService.updateLoggedInUserSocket(data.memberId, client.id);
+        void client.join(data.roomId);
+      }
+
+      const membersWithDetails = this.roomsService.getRoomMembersWithDetails(room.roomId);
+
+      client.emit('room-joined', {
+        roomId: room.roomId,
+        hostId: room.hostId,
+        members: room.members,
+        membersWithDetails,
+      });
+      return;
+    }
+
     // Check if user is already in a different room
     const existingRoomId = this.roomsService.getUserRoom(data.memberId);
     if (existingRoomId && existingRoomId !== data.roomId) {
@@ -145,17 +216,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       }
     }
 
-    // Check if user is already in this room (avoid duplicate)
-    if (existingRoomId === data.roomId) {
-      console.log(`${data.memberId} is already in room ${data.roomId}`);
-      client.emit('room-joined', {
-        roomId: room.roomId,
-        hostId: room.hostId,
-        members: room.members,
-      });
-      return;
-    }
-
     // Add member to room
     const updatedRoom = this.roomsService.joinRoom(data.roomId, data.memberId);
     if (!updatedRoom) {
@@ -165,19 +225,28 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     this.roomsService.setUserSocket(data.memberId, client.id);
     this.roomsService.setUserRoom(data.memberId, data.roomId);
+
+    // Add user to logged-in users array
+    this.roomsService.addLoggedInUser(data.memberId, data.name, data.roomId, client.id);
+
     void client.join(data.roomId);
 
-    console.log(`${data.memberId} joined room: ${data.roomId}`);
+    console.log(`${data.memberId} (${data.name}) joined room: ${data.roomId}`);
+
+    const membersWithDetails = this.roomsService.getRoomMembersWithDetails(data.roomId);
 
     client.emit('room-joined', {
       roomId: updatedRoom.roomId,
       hostId: updatedRoom.hostId,
       members: updatedRoom.members,
+      membersWithDetails,
     });
 
     client.to(data.roomId).emit('member-joined', {
       memberId: data.memberId,
+      memberName: data.name,
       members: updatedRoom.members,
+      membersWithDetails,
     });
 
     // Send messages history when user joined room
@@ -214,6 +283,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     this.roomsService.deleteUserSocket(data.memberId);
     this.roomsService.deleteUserRoom(data.memberId);
+    this.roomsService.removeLoggedInUser(data.memberId);
     void client.leave(data.roomId);
   }
 
