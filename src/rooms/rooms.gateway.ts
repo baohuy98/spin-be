@@ -185,8 +185,10 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         // Update the socket mapping to the new connection
         this.roomsService.setUserSocket(data.memberId, client.id);
         this.roomsService.updateLoggedInUserSocket(data.memberId, client.id);
-        void client.join(data.roomId);
       }
+
+      // Always join the socket to the room, regardless of whether it's a new or existing socket
+      void client.join(data.roomId);
 
       const membersWithDetails = this.roomsService.getRoomMembersWithDetails(room.roomId);
 
