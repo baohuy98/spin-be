@@ -21,6 +21,8 @@ import {
   HostReadyDto,
   StopSharingDto,
 } from './dto/webrtc.dto';
+import { FirebaseService } from '../firebase/firebase.service';
+import type { ChatMessage } from '../firebase/firebase.service';
 
 @WebSocketGateway({
   cors: {
@@ -32,7 +34,10 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
 
-  constructor(private readonly roomsService: RoomsService) {}
+  constructor(
+    private readonly roomsService: RoomsService,
+    private readonly firebaseService: FirebaseService,
+  ) {}
 
   handleConnection(client: Socket) {
     console.log(`Client connected: ${client.id}`);
@@ -282,5 +287,35 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     console.log(`Screen sharing stopped in room: ${data.roomId}`);
     client.to(data.roomId).emit('stop-sharing');
+  }
+
+  @SubscribeMessage('chat-message')
+  async handleChatMessage(
+    @MessageBody() data: ChatMessage,
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log('Received chat message:', data);
+
+    // Save message to Firebase
+    try {
+      await this.firebaseService.saveMessage(data);
+    } catch (error) {
+      console.error('Failed to save message:', error);
+    }
+
+    // Broadcast message to all members in the room
+    this.server.to(data.roomId).emit('chat-message', data);
+  }
+
+  @SubscribeMessage('get-chat-history')
+  async handleGetChatHistory(
+    @MessageBody() data: { roomId: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log('Get chat history for room:', data.roomId);
+
+    // Fetch messages from Firebase
+    const messages = await this.firebaseService.getMessages(data.roomId);
+    client.emit('chat-history', { messages });
   }
 }
