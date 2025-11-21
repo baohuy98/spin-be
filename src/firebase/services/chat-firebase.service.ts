@@ -1,15 +1,7 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as admin from 'firebase-admin';
-
-export interface ChatMessage {
-  id: string;
-  userId: string;
-  userName: string;
-  message: string;
-  timestamp: number;
-  roomId: string;
-}
+import { Message } from '../entities/message.entity';
 
 @Injectable()
 export class FirebaseService implements OnModuleInit {
@@ -18,7 +10,6 @@ export class FirebaseService implements OnModuleInit {
   constructor(private configService: ConfigService) { }
 
   onModuleInit() {
-    // Initialize Firebase Admin
     if (!admin.apps.length) {
       const projectId = this.configService.get<string>('firebase.projectId');
       const clientEmail = this.configService.get<string>(
@@ -44,14 +35,9 @@ export class FirebaseService implements OnModuleInit {
     this.db = admin.firestore();
   }
 
-  async saveMessage(message: ChatMessage): Promise<void> {
+  async saveMessage(message: Message): Promise<void> {
     try {
-      await this.db
-        .collection('rooms')
-        .doc(message.roomId)
-        .collection('messages')
-        .doc(message.id)
-        .set(message);
+      await this.db.collection('messages').doc(message.id).set(message);
       console.log('Message saved to Firebase:', message.id);
     } catch (error) {
       console.error('Error saving message to Firebase:', error);
@@ -59,23 +45,21 @@ export class FirebaseService implements OnModuleInit {
     }
   }
 
-  async getMessages(roomId: string, limit = 50): Promise<ChatMessage[]> {
+  async getMessages(roomId: string, limit = 50): Promise<Message[]> {
     try {
       const snapshot = await this.db
-        .collection('rooms')
-        .doc(roomId)
         .collection('messages')
-        .orderBy('timestamp', 'desc')
+        .where('roomId', '==', roomId)
+        .orderBy('timestamp', 'asc')
         .limit(limit)
         .get();
 
-      const messages: ChatMessage[] = [];
+      const messages: Message[] = [];
       snapshot.forEach((doc) => {
-        messages.push(doc.data() as ChatMessage);
+        messages.push(doc.data() as Message);
       });
 
-      // Return in ascending order (oldest first)
-      return messages.reverse();
+      return messages;
     } catch (error) {
       console.error('Error fetching messages from Firebase:', error);
       return [];
@@ -85,9 +69,8 @@ export class FirebaseService implements OnModuleInit {
   async deleteRoomMessages(roomId: string): Promise<void> {
     try {
       const snapshot = await this.db
-        .collection('rooms')
-        .doc(roomId)
         .collection('messages')
+        .where('roomId', '==', roomId)
         .get();
 
       const batch = this.db.batch();

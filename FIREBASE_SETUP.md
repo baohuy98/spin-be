@@ -56,20 +56,20 @@ npm run start:dev
 
 ## Cấu trúc dữ liệu trong Firestore
 
-Dữ liệu sẽ được lưu theo cấu trúc:
+Dữ liệu sẽ được lưu theo cấu trúc đơn giản:
 
 ```
-rooms/
-  {roomId}/
-    messages/
-      {messageId}/
-        - id: string
-        - userId: string
-        - userName: string
-        - message: string
-        - timestamp: number
-        - roomId: string
+messages/
+  {messageId}/
+    - id: string
+    - userId: string
+    - userName: string
+    - message: string
+    - timestamp: number
+    - roomId: string
 ```
+
+Lưu ý: Sử dụng cấu trúc flat collection để dễ query và không cần tạo composite index.
 
 ## Events đã implement
 

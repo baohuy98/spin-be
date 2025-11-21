@@ -1,28 +1,30 @@
 import {
-  WebSocketGateway,
-  WebSocketServer,
-  SubscribeMessage,
+  ConnectedSocket,
+  MessageBody,
   OnGatewayConnection,
   OnGatewayDisconnect,
-  MessageBody,
-  ConnectedSocket,
+  SubscribeMessage,
+  WebSocketGateway,
+  WebSocketServer,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { RoomsService } from './services/rooms.service';
+import { SendMessageDto } from 'src/firebase/dto/chat.dto';
+import { Message } from 'src/firebase/entities/message.entity';
+import { FirebaseService } from 'src/firebase/services/chat-firebase.service';
+import { v4 as uuidv4 } from 'uuid';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { JoinRoomDto } from './dto/join-room.dto';
 import { LeaveRoomDto } from './dto/leave-room.dto';
-import { ValidateRoomDto } from './dto/validate-room.dto';
 import { SpinResultDto } from './dto/spin-result.dto';
+import { ValidateRoomDto } from './dto/validate-room.dto';
 import {
-  OfferDto,
   AnswerDto,
-  IceCandidateDto,
   HostReadyDto,
+  IceCandidateDto,
+  OfferDto,
   StopSharingDto,
 } from './dto/webrtc.dto';
-import { FirebaseService } from '../firebase/firebase.service';
-import type { ChatMessage } from '../firebase/firebase.service';
+import { RoomsService } from './services/rooms.service';
 
 @WebSocketGateway({
   cors: {
@@ -37,7 +39,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   constructor(
     private readonly roomsService: RoomsService,
     private readonly firebaseService: FirebaseService,
-  ) {}
+  ) { }
 
   handleConnection(client: Socket) {
     console.log(`Client connected: ${client.id}`);
@@ -114,7 +116,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('join-room')
-  handleJoinRoom(
+  async handleJoinRoom(
     @MessageBody() data: JoinRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
@@ -177,6 +179,10 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       memberId: data.memberId,
       members: updatedRoom.members,
     });
+
+    // Send messages history when user joined room
+    const messages = await this.firebaseService.getMessages(data.roomId);
+    client.emit('chat-history', { messages });
 
     // Notify host that a new viewer joined (for WebRTC setup)
     if (data.memberId !== updatedRoom.hostId) {
@@ -289,33 +295,25 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     client.to(data.roomId).emit('stop-sharing');
   }
 
-  @SubscribeMessage('chat-message')
-  async handleChatMessage(
-    @MessageBody() data: ChatMessage,
-    @ConnectedSocket() client: Socket,
-  ) {
-    console.log('Received chat message:', data);
+  @SubscribeMessage('send-message')
+  async handleSendMessage(@MessageBody() data: SendMessageDto) {
+    console.log('Received send-message:', data);
 
-    // Save message to Firebase
+    const message = new Message({
+      id: uuidv4(),
+      userId: data.userId,
+      userName: data.userName,
+      message: data.message,
+      timestamp: Date.now(),
+      roomId: data.roomId,
+    });
+
     try {
-      await this.firebaseService.saveMessage(data);
+      await this.firebaseService.saveMessage(message);
     } catch (error) {
       console.error('Failed to save message:', error);
     }
 
-    // Broadcast message to all members in the room
-    this.server.to(data.roomId).emit('chat-message', data);
-  }
-
-  @SubscribeMessage('get-chat-history')
-  async handleGetChatHistory(
-    @MessageBody() data: { roomId: string },
-    @ConnectedSocket() client: Socket,
-  ) {
-    console.log('Get chat history for room:', data.roomId);
-
-    // Fetch messages from Firebase
-    const messages = await this.firebaseService.getMessages(data.roomId);
-    client.emit('chat-history', { messages });
+    this.server.to(data.roomId).emit('chat-message', message);
   }
 }
