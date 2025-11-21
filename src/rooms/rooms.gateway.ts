@@ -8,13 +8,19 @@ import {
   ConnectedSocket,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-
-interface Room {
-  roomId: string;
-  hostId: string;
-  members: string[];
-  createdAt: Date;
-}
+import { RoomsService } from './services/rooms.service';
+import { CreateRoomDto } from './dto/create-room.dto';
+import { JoinRoomDto } from './dto/join-room.dto';
+import { LeaveRoomDto } from './dto/leave-room.dto';
+import { ValidateRoomDto } from './dto/validate-room.dto';
+import { SpinResultDto } from './dto/spin-result.dto';
+import {
+  OfferDto,
+  AnswerDto,
+  IceCandidateDto,
+  HostReadyDto,
+  StopSharingDto,
+} from './dto/webrtc.dto';
 
 @WebSocketGateway({
   cors: {
@@ -26,8 +32,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
 
-  private rooms: Map<string, Room> = new Map();
-  private userSocketMap: Map<string, string> = new Map();
+  constructor(private readonly roomsService: RoomsService) {}
 
   handleConnection(client: Socket) {
     console.log(`Client connected: ${client.id}`);
@@ -36,42 +41,56 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   handleDisconnect(client: Socket) {
     console.log(`Client disconnected: ${client.id}`);
 
-    this.rooms.forEach((room, roomId) => {
-      const index = room.members.indexOf(client.id);
-      if (index > -1) {
-        room.members.splice(index, 1);
+    const userId = this.roomsService.findUserIdBySocketId(client.id);
+    if (!userId) {
+      return;
+    }
 
+    const result = this.roomsService.handleUserDisconnect(userId);
+    if (result) {
+      const roomId = this.roomsService.getUserRoom(userId);
+      if (roomId) {
         this.server.to(roomId).emit('member-left', {
-          memberId: client.id,
-          members: room.members,
+          memberId: result.memberId,
+          members: result.members,
         });
-
-        if (room.members.length === 0) {
-          this.rooms.delete(roomId);
-          console.log(`Room deleted: ${roomId}`);
-        }
+        console.log(`${userId} left room: ${roomId}`);
       }
-    });
+
+      if (result.roomDeleted) {
+        console.log(`Room deleted: ${roomId}`);
+      }
+    }
   }
 
   @SubscribeMessage('create-room')
   handleCreateRoom(
-    @MessageBody() data: { hostId: string },
+    @MessageBody() data: CreateRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
-    const roomId = `room-${Date.now()}`;
-    const room: Room = {
-      roomId,
-      hostId: data.hostId,
-      members: [data.hostId],
-      createdAt: new Date(),
-    };
+    // Check if user is already in a room
+    const existingRoomId = this.roomsService.getUserRoom(data.hostId);
+    if (existingRoomId) {
+      // Leave the existing room first
+      const result = this.roomsService.leaveRoom(existingRoomId, data.hostId);
+      if (result) {
+        void client.leave(existingRoomId);
+        this.server.to(existingRoomId).emit('member-left', {
+          memberId: result.memberId,
+          members: result.members,
+        });
+        console.log(
+          `${data.hostId} left previous room ${existingRoomId} to create new room`,
+        );
+      }
+    }
 
-    this.rooms.set(roomId, room);
-    this.userSocketMap.set(data.hostId, client.id);
-    client.join(roomId);
+    const room = this.roomsService.createRoom(data.hostId);
+    this.roomsService.setUserSocket(data.hostId, client.id);
+    this.roomsService.setUserRoom(data.hostId, room.roomId);
+    void client.join(room.roomId);
 
-    console.log(`Room created: ${roomId} by ${data.hostId}`);
+    console.log(`Room created: ${room.roomId} by ${data.hostId}`);
 
     client.emit('room-created', {
       roomId: room.roomId,
@@ -80,41 +99,83 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
   }
 
-  @SubscribeMessage('join-room')
-  handleJoinRoom(
-    @MessageBody() data: { roomId: string; memberId: string },
+  @SubscribeMessage('validate-room')
+  handleValidateRoom(
+    @MessageBody() data: ValidateRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
-    const room = this.rooms.get(data.roomId);
+    const validation = this.roomsService.validateRoom(data.roomId);
+    client.emit('room-validated', validation);
+  }
+
+  @SubscribeMessage('join-room')
+  handleJoinRoom(
+    @MessageBody() data: JoinRoomDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    const room = this.roomsService.findRoomById(data.roomId);
 
     if (!room) {
+      console.log(`Room not found: ${data.roomId}`);
       client.emit('error', { message: 'Room not found' });
       return;
     }
 
-    if (!room.members.includes(data.memberId)) {
-      room.members.push(data.memberId);
+    // Check if user is already in a different room
+    const existingRoomId = this.roomsService.getUserRoom(data.memberId);
+    if (existingRoomId && existingRoomId !== data.roomId) {
+      // Leave the existing room first
+      const result = this.roomsService.leaveRoom(existingRoomId, data.memberId);
+      if (result) {
+        void client.leave(existingRoomId);
+        this.server.to(existingRoomId).emit('member-left', {
+          memberId: result.memberId,
+          members: result.members,
+        });
+        console.log(
+          `${data.memberId} left previous room ${existingRoomId} to join ${data.roomId}`,
+        );
+      }
     }
 
-    this.userSocketMap.set(data.memberId, client.id);
-    client.join(data.roomId);
+    // Check if user is already in this room (avoid duplicate)
+    if (existingRoomId === data.roomId) {
+      console.log(`${data.memberId} is already in room ${data.roomId}`);
+      client.emit('room-joined', {
+        roomId: room.roomId,
+        hostId: room.hostId,
+        members: room.members,
+      });
+      return;
+    }
+
+    // Add member to room
+    const updatedRoom = this.roomsService.joinRoom(data.roomId, data.memberId);
+    if (!updatedRoom) {
+      client.emit('error', { message: 'Failed to join room' });
+      return;
+    }
+
+    this.roomsService.setUserSocket(data.memberId, client.id);
+    this.roomsService.setUserRoom(data.memberId, data.roomId);
+    void client.join(data.roomId);
 
     console.log(`${data.memberId} joined room: ${data.roomId}`);
 
     client.emit('room-joined', {
-      roomId: room.roomId,
-      hostId: room.hostId,
-      members: room.members,
+      roomId: updatedRoom.roomId,
+      hostId: updatedRoom.hostId,
+      members: updatedRoom.members,
     });
 
     client.to(data.roomId).emit('member-joined', {
       memberId: data.memberId,
-      members: room.members,
+      members: updatedRoom.members,
     });
 
     // Notify host that a new viewer joined (for WebRTC setup)
-    if (data.memberId !== room.hostId) {
-      const hostSocketId = this.userSocketMap.get(room.hostId);
+    if (data.memberId !== updatedRoom.hostId) {
+      const hostSocketId = this.roomsService.getUserSocket(updatedRoom.hostId);
       if (hostSocketId) {
         this.server.to(hostSocketId).emit('viewer-joined', {
           viewerId: client.id,
@@ -125,39 +186,29 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('leave-room')
   handleLeaveRoom(
-    @MessageBody() data: { roomId: string; memberId: string },
+    @MessageBody() data: LeaveRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
-    const room = this.rooms.get(data.roomId);
+    const result = this.roomsService.leaveRoom(data.roomId, data.memberId);
+    if (result) {
+      this.server.to(data.roomId).emit('member-left', {
+        memberId: result.memberId,
+        members: result.members,
+      });
 
-    if (!room) {
-      return;
+      if (result.roomDeleted) {
+        console.log(`Room deleted: ${data.roomId}`);
+      }
     }
 
-    const index = room.members.indexOf(data.memberId);
-    if (index > -1) {
-      room.members.splice(index, 1);
-    }
-
-    this.userSocketMap.delete(data.memberId);
-    client.leave(data.roomId);
-
-    console.log(`${data.memberId} left room: ${data.roomId}`);
-
-    this.server.to(data.roomId).emit('member-left', {
-      memberId: data.memberId,
-      members: room.members,
-    });
-
-    if (room.members.length === 0) {
-      this.rooms.delete(data.roomId);
-      console.log(`Room deleted: ${data.roomId}`);
-    }
+    this.roomsService.deleteUserSocket(data.memberId);
+    this.roomsService.deleteUserRoom(data.memberId);
+    void client.leave(data.roomId);
   }
 
   @SubscribeMessage('spin-result')
   handleSpinResult(
-    @MessageBody() data: { roomId: string; result: string },
+    @MessageBody() data: SpinResultDto,
     @ConnectedSocket() client: Socket,
   ) {
     console.log(`Spin result in ${data.roomId}: ${data.result}`);
@@ -166,7 +217,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('host-ready-to-share')
   handleHostReadyToShare(
-    @MessageBody() data: { roomId: string },
+    @MessageBody() data: HostReadyDto,
     @ConnectedSocket() client: Socket,
   ) {
     console.log(`Host ready to share in room: ${data.roomId}`);
@@ -176,11 +227,12 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('offer')
   handleOffer(
-    @MessageBody()
-    data: { roomId: string; offer: RTCSessionDescriptionInit; to: string },
+    @MessageBody() data: OfferDto,
     @ConnectedSocket() client: Socket,
   ) {
-    console.log(`Offer received for room: ${data.roomId}, sending to: ${data.to}`);
+    console.log(
+      `Offer received for room: ${data.roomId}, sending to: ${data.to}`,
+    );
     this.server.to(data.to).emit('offer', {
       offer: data.offer,
       from: client.id,
@@ -189,8 +241,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('answer')
   handleAnswer(
-    @MessageBody()
-    data: { roomId: string; answer: RTCSessionDescriptionInit },
+    @MessageBody() data: AnswerDto,
     @ConnectedSocket() client: Socket,
   ) {
     console.log(`Answer received from: ${client.id}`);
@@ -203,8 +254,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('ice-candidate')
   handleIceCandidate(
-    @MessageBody()
-    data: { roomId: string; candidate: RTCIceCandidateInit; to?: string },
+    @MessageBody() data: IceCandidateDto,
     @ConnectedSocket() client: Socket,
   ) {
     console.log(
@@ -227,7 +277,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('stop-sharing')
   handleStopSharing(
-    @MessageBody() data: { roomId: string },
+    @MessageBody() data: StopSharingDto,
     @ConnectedSocket() client: Socket,
   ) {
     console.log(`Screen sharing stopped in room: ${data.roomId}`);
