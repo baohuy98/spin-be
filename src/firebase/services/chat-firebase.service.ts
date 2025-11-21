@@ -38,7 +38,6 @@ export class FirebaseService implements OnModuleInit {
   async saveMessage(message: Message): Promise<void> {
     try {
       await this.db.collection('messages').doc(message.id).set(message);
-      console.log('Message saved to Firebase:', message.id);
     } catch (error) {
       console.error('Error saving message to Firebase:', error);
       throw error;
@@ -79,7 +78,6 @@ export class FirebaseService implements OnModuleInit {
       });
 
       await batch.commit();
-      console.log(`Deleted all messages for room: ${roomId}`);
     } catch (error) {
       console.error('Error deleting room messages:', error);
     }

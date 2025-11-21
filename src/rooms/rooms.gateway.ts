@@ -297,8 +297,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   @SubscribeMessage('send-message')
   async handleSendMessage(@MessageBody() data: SendMessageDto) {
-    console.log('Received send-message:', data);
-
     const message = new Message({
       id: uuidv4(),
       userId: data.userId,
@@ -309,7 +307,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
 
     try {
-      await this.firebaseService.saveMessage(message);
+      await this.firebaseService.saveMessage({ ...message });
     } catch (error) {
       console.error('Failed to save message:', error);
     }
