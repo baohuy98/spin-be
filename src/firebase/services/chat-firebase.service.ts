@@ -1,4 +1,5 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import * as admin from 'firebase-admin';
 
 export interface ChatMessage {
@@ -14,15 +15,28 @@ export interface ChatMessage {
 export class FirebaseService implements OnModuleInit {
   private db: admin.firestore.Firestore;
 
+  constructor(private configService: ConfigService) { }
+
   onModuleInit() {
     // Initialize Firebase Admin
-
     if (!admin.apps.length) {
+      const projectId = this.configService.get<string>('firebase.projectId');
+      const clientEmail = this.configService.get<string>(
+        'firebase.clientEmail',
+      );
+      const privateKey = this.configService.get<string>('firebase.privateKey');
+
+      if (!projectId || !clientEmail || !privateKey) {
+        throw new Error(
+          'Firebase configuration is missing. Please check your .env file.',
+        );
+      }
+
       admin.initializeApp({
         credential: admin.credential.cert({
-          projectId: process.env.FIREBASE_PROJECT_ID,
-          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+          projectId,
+          clientEmail,
+          privateKey,
         }),
       });
     }
