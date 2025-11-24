@@ -1,7 +1,7 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as admin from 'firebase-admin';
-import { Message } from '../../chat/entities/message.entity';
+import { Message, MessageReaction } from '../../chat/entities/message.entity';
 import { StorageService } from '../interfaces/storage.interface';
 
 @Injectable()
@@ -81,6 +81,57 @@ export class FirebaseService implements StorageService, OnModuleInit {
       await batch.commit();
     } catch (error) {
       console.error('Error deleting room messages:', error);
+    }
+  }
+
+  async addReaction(
+    roomId: string,
+    messageId: string,
+    userId: string,
+    emoji: string,
+  ): Promise<MessageReaction[]> {
+    try {
+      const docRef = this.db.collection('messages').doc(messageId);
+      const doc = await docRef.get();
+
+      if (!doc.exists) {
+        throw new Error('Message not found');
+      }
+
+      const message = doc.data() as Message;
+
+      if (message.roomId !== roomId) {
+        throw new Error('Message not found in this room');
+      }
+
+      const reactions: MessageReaction[] = message.reactions || [];
+      const existingReaction = reactions.find((r) => r.emoji === emoji);
+
+      if (existingReaction) {
+        if (existingReaction.userIds.includes(userId)) {
+          // Remove user from reaction (toggle off)
+          existingReaction.userIds = existingReaction.userIds.filter(
+            (id) => id !== userId,
+          );
+          // Remove reaction if no users left
+          if (existingReaction.userIds.length === 0) {
+            const index = reactions.indexOf(existingReaction);
+            reactions.splice(index, 1);
+          }
+        } else {
+          // Add user to existing reaction
+          existingReaction.userIds.push(userId);
+        }
+      } else {
+        // Create new reaction
+        reactions.push({ emoji, userIds: [userId] });
+      }
+
+      await docRef.update({ reactions });
+      return reactions;
+    } catch (error) {
+      console.error('Error adding reaction to Firebase:', error);
+      throw error;
     }
   }
 }

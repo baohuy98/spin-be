@@ -11,7 +11,7 @@ import {
   STORAGE_SERVICE,
   type StorageService,
 } from 'src/storage/interfaces/storage.interface';
-import { SendMessageDto } from './dto/chat.dto';
+import { ReactToMessageDto, SendMessageDto } from './dto/chat.dto';
 import { Message } from './entities/message.entity';
 
 @WebSocketGateway({
@@ -47,5 +47,24 @@ export class ChatGateway {
     }
 
     this.server.to(data.roomId).emit('chat-message', message);
+  }
+
+  @SubscribeMessage('react-to-message')
+  async handleReactToMessage(@MessageBody() data: ReactToMessageDto) {
+    try {
+      const reactions = await this.storageService.addReaction(
+        data.roomId,
+        data.messageId,
+        data.userId,
+        data.emoji,
+      );
+
+      this.server.to(data.roomId).emit('message-reaction-updated', {
+        messageId: data.messageId,
+        reactions,
+      });
+    } catch (error) {
+      console.error('Failed to add reaction:', error);
+    }
   }
 }
