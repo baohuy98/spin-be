@@ -9,13 +9,10 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import { Server, Socket } from 'socket.io';
-import { SendMessageDto } from 'src/firebase/dto/chat.dto';
-import { Message } from 'src/firebase/entities/message.entity';
 import {
   STORAGE_SERVICE,
   type StorageService,
 } from 'src/storage/interfaces/storage.interface';
-import { v4 as uuidv4 } from 'uuid';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { JoinRoomDto } from './dto/join-room.dto';
 import { LeaveRoomDto } from './dto/leave-room.dto';
@@ -501,25 +498,5 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         viewerId: client.id,
       });
     }
-  }
-
-  @SubscribeMessage('send-message')
-  async handleSendMessage(@MessageBody() data: SendMessageDto) {
-    const message = new Message({
-      id: uuidv4(),
-      userId: data.userId,
-      userName: data.userName,
-      message: data.message,
-      timestamp: Date.now(),
-      roomId: data.roomId,
-    });
-
-    try {
-      await this.storageService.saveMessage({ ...message });
-    } catch (error) {
-      console.error('Failed to save message:', error);
-    }
-
-    this.server.to(data.roomId).emit('chat-message', message);
   }
 }

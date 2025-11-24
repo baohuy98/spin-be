@@ -1,8 +1,8 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { FirebaseService } from '../firebase/services/chat-firebase.service';
-import { JsonStorageService } from './services/json-storage.service';
 import { STORAGE_SERVICE } from './interfaces/storage.interface';
+import { FirebaseService } from './services/chat-firebase.service';
+import { JsonStorageService } from './services/json-storage.service';
 
 @Module({
   providers: [
@@ -20,4 +20,4 @@ import { STORAGE_SERVICE } from './interfaces/storage.interface';
   ],
   exports: [STORAGE_SERVICE],
 })
-export class StorageModule {}
+export class StorageModule { }

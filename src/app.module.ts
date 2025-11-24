@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { ChatModule } from './chat/chat.module';
 import { RoomsModule } from './rooms/rooms.module';
 import firebaseConfig from './config/firebase.config';
 import storageConfig from './config/storage.config';
@@ -14,6 +15,7 @@ import storageConfig from './config/storage.config';
       envFilePath: '.env',
     }),
     RoomsModule,
+    ChatModule,
   ],
   controllers: [AppController],
   providers: [AppService],

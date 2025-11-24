@@ -4,7 +4,7 @@ import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Message } from '../../firebase/entities/message.entity';
+import { Message, MessageReaction } from '../../chat/entities/message.entity';
 import { StorageService } from '../interfaces/storage.interface';
 
 interface StorageData {
@@ -94,6 +94,56 @@ export class JsonStorageService implements StorageService, OnModuleInit {
       await this.saveData();
     } catch (error) {
       console.error('Error deleting room messages from JSON:', error);
+    }
+  }
+
+  async addReaction(
+    roomId: string,
+    messageId: string,
+    userId: string,
+    emoji: string,
+  ): Promise<MessageReaction[]> {
+    try {
+      const message = this.data.messages.find(
+        (msg) => msg.id === messageId && msg.roomId === roomId,
+      );
+
+      if (!message) {
+        throw new Error('Message not found');
+      }
+
+      if (!message.reactions) {
+        message.reactions = [];
+      }
+
+      const existingReaction = message.reactions.find((r) => r.emoji === emoji);
+
+      if (existingReaction) {
+        if (existingReaction.userIds.includes(userId)) {
+          // Remove user from reaction (toggle off)
+          existingReaction.userIds = existingReaction.userIds.filter(
+            (id) => id !== userId,
+          );
+          // Remove reaction if no users left
+          if (existingReaction.userIds.length === 0) {
+            message.reactions = message.reactions.filter(
+              (r) => r.emoji !== emoji,
+            );
+          }
+        } else {
+          // Add user to existing reaction
+          existingReaction.userIds.push(userId);
+        }
+      } else {
+        // Create new reaction
+        message.reactions.push({ emoji, userIds: [userId] });
+      }
+
+      await this.saveData();
+      return message.reactions;
+    } catch (error) {
+      console.error('Error adding reaction to JSON:', error);
+      throw error;
     }
   }
 }
