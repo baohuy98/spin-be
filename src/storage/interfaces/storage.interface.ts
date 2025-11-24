@@ -1,4 +1,4 @@
-import { Message } from '../../firebase/entities/message.entity';
+import { Message } from '../../chat/entities/message.entity';
 
 export interface StorageService {
   saveMessage(message: Message): Promise<void>;

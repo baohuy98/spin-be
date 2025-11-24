@@ -1,8 +1,8 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as admin from 'firebase-admin';
-import { Message } from '../entities/message.entity';
-import { StorageService } from '../../storage/interfaces/storage.interface';
+import { Message } from '../../chat/entities/message.entity';
+import { StorageService } from '../interfaces/storage.interface';
 
 @Injectable()
 export class FirebaseService implements StorageService, OnModuleInit {

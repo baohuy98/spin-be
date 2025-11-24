@@ -4,7 +4,7 @@ import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Message } from '../../firebase/entities/message.entity';
+import { Message } from '../../chat/entities/message.entity';
 import { StorageService } from '../interfaces/storage.interface';
 
 interface StorageData {
