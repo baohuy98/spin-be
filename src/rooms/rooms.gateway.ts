@@ -288,6 +288,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         }
       }
 
+      void this.handleGetChatHistory(client, data.roomId);
       return;
     }
 
