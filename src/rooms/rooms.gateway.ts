@@ -1,3 +1,4 @@
+import { Inject } from '@nestjs/common';
 import {
   ConnectedSocket,
   MessageBody,
@@ -10,7 +11,10 @@ import {
 import { Server, Socket } from 'socket.io';
 import { SendMessageDto } from 'src/firebase/dto/chat.dto';
 import { Message } from 'src/firebase/entities/message.entity';
-import { FirebaseService } from 'src/firebase/services/chat-firebase.service';
+import {
+  STORAGE_SERVICE,
+  type StorageService,
+} from 'src/storage/interfaces/storage.interface';
 import { v4 as uuidv4 } from 'uuid';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { JoinRoomDto } from './dto/join-room.dto';
@@ -42,7 +46,8 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   constructor(
     private readonly roomsService: RoomsService,
-    private readonly firebaseService: FirebaseService,
+    @Inject(STORAGE_SERVICE)
+    private readonly storageService: StorageService,
   ) { }
 
   handleConnection(client: Socket) {
@@ -127,6 +132,12 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.roomsService.removeLoggedInUser(userId);
   }
 
+  async handleGetChatHistory(client: Socket, roomId: string) {
+    // Send messages history when user joined room/host created room
+    const messages = await this.storageService.getMessages(roomId);
+    client.emit('chat-history', { messages });
+  }
+
   @SubscribeMessage('create-room')
   handleCreateRoom(
     @MessageBody() data: CreateRoomDto,
@@ -195,6 +206,8 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         hostSocketId: client.id,
       });
     }
+
+    void this.handleGetChatHistory(client, room.roomId);
   }
 
   @SubscribeMessage('validate-room')
@@ -207,7 +220,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('join-room')
-  async handleJoinRoom(
+  handleJoinRoom(
     @MessageBody() data: JoinRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
@@ -275,6 +288,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         }
       }
 
+      void this.handleGetChatHistory(client, data.roomId);
       return;
     }
 
@@ -328,10 +342,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       membersWithDetails,
     });
 
-    // Send messages history when user joined room
-    const messages = await this.firebaseService.getMessages(data.roomId);
-    client.emit('chat-history', { messages });
-
     // Notify host that a new viewer joined (for WebRTC setup)
     if (data.memberId !== updatedRoom.hostId) {
       const hostSocketId = this.roomsService.getUserSocket(updatedRoom.hostId);
@@ -341,6 +351,8 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         });
       }
     }
+
+    void this.handleGetChatHistory(client, data.roomId);
   }
 
   @SubscribeMessage('leave-room')
@@ -503,7 +515,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     });
 
     try {
-      await this.firebaseService.saveMessage({ ...message });
+      await this.storageService.saveMessage({ ...message });
     } catch (error) {
       console.error('Failed to save message:', error);
     }

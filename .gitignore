@@ -45,3 +45,6 @@ lerna-debug.log*
 .cache
 .temp
 .tmp
+
+# Local JSON storage
+/data

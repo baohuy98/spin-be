@@ -2,9 +2,10 @@ import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as admin from 'firebase-admin';
 import { Message } from '../entities/message.entity';
+import { StorageService } from '../../storage/interfaces/storage.interface';
 
 @Injectable()
-export class FirebaseService implements OnModuleInit {
+export class FirebaseService implements StorageService, OnModuleInit {
   private db: admin.firestore.Firestore;
 
   constructor(private configService: ConfigService) { }
