@@ -2,10 +2,10 @@ import { Module } from '@nestjs/common';
 import { RoomsGateway } from './rooms.gateway';
 import { RoomsService } from './services/rooms.service';
 import { RoomsRepository } from './repositories/rooms.repository';
-import { FirebaseModule } from '../firebase/firebase.module';
+import { StorageModule } from '../storage/storage.module';
 
 @Module({
-  imports: [FirebaseModule],
+  imports: [StorageModule],
   providers: [RoomsGateway, RoomsService, RoomsRepository],
   exports: [RoomsService],
 })
