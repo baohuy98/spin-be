@@ -132,6 +132,12 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.roomsService.removeLoggedInUser(userId);
   }
 
+  async handleGetChatHistory(client: Socket, roomId: string) {
+    // Send messages history when user joined room/host created room
+    const messages = await this.storageService.getMessages(roomId);
+    client.emit('chat-history', { messages });
+  }
+
   @SubscribeMessage('create-room')
   handleCreateRoom(
     @MessageBody() data: CreateRoomDto,
@@ -200,6 +206,8 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         hostSocketId: client.id,
       });
     }
+
+    void this.handleGetChatHistory(client, room.roomId);
   }
 
   @SubscribeMessage('validate-room')
@@ -212,7 +220,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('join-room')
-  async handleJoinRoom(
+  handleJoinRoom(
     @MessageBody() data: JoinRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
@@ -333,10 +341,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       membersWithDetails,
     });
 
-    // Send messages history when user joined room
-    const messages = await this.storageService.getMessages(data.roomId);
-    client.emit('chat-history', { messages });
-
     // Notify host that a new viewer joined (for WebRTC setup)
     if (data.memberId !== updatedRoom.hostId) {
       const hostSocketId = this.roomsService.getUserSocket(updatedRoom.hostId);
@@ -346,6 +350,8 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         });
       }
     }
+
+    void this.handleGetChatHistory(client, data.roomId);
   }
 
   @SubscribeMessage('leave-room')
