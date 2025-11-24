@@ -152,8 +152,14 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // Check if this is a different socket (host reconnecting/reloading)
       const existingSocketId = this.roomsService.getUserSocket(data.hostId);
       if (existingSocketId && existingSocketId !== client.id) {
-        console.log(`Disconnecting old socket ${existingSocketId} for host ${data.hostId}`);
-        // Disconnect the old socket without triggering full cleanup
+        console.log(
+          `Host ${data.hostId} reconnecting: ${existingSocketId} -> ${client.id}`,
+        );
+        // Update socket mapping BEFORE disconnecting old socket
+        // This ensures handleDisconnect won't find the old socket's userId
+        this.roomsService.setUserSocket(data.hostId, client.id);
+
+        // Now disconnect the old socket - handleDisconnect will ignore it
         const oldSocket = this.server.sockets.sockets.get(existingSocketId);
         if (oldSocket) {
           oldSocket.disconnect(true);
@@ -175,7 +181,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const room = this.roomsService.createRoom(data.hostId);
     const isRejoining = room.members.length > 1; // More than just host means existing viewers
 
-    // Update host's socket mapping
+    // Update host's socket mapping (may already be set above for reconnection)
     this.roomsService.setUserSocket(data.hostId, client.id);
     this.roomsService.setUserRoom(data.hostId, room.roomId);
 
@@ -240,23 +246,36 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Handle reconnection: user is in room.members OR was in grace period OR is logged in
     if (isAlreadyInRoom || wasReconnecting || isLoggedInToRoom) {
-      console.log(`${data.memberId} (${data.name}) reconnecting to room ${data.roomId} [inRoom=${isAlreadyInRoom}, wasReconnecting=${wasReconnecting}, loggedIn=${isLoggedInToRoom}]`);
+      console.log(
+        `${data.memberId} (${data.name}) reconnecting to room ${data.roomId} [inRoom=${isAlreadyInRoom}, wasReconnecting=${wasReconnecting}, loggedIn=${isLoggedInToRoom}]`,
+      );
 
       // Handle old socket if exists
       const existingSocketId = this.roomsService.getUserSocket(data.memberId);
       if (existingSocketId && existingSocketId !== client.id) {
-        console.log(`Updating socket for ${data.memberId}: ${existingSocketId} -> ${client.id}`);
-        // Disconnect the old socket if still connected
+        console.log(
+          `Viewer ${data.memberId} reconnecting: ${existingSocketId} -> ${client.id}`,
+        );
+        // Update socket mapping BEFORE disconnecting old socket
+        // This ensures handleDisconnect won't find the old socket's userId
+        this.roomsService.setUserSocket(data.memberId, client.id);
+
+        // Now disconnect the old socket - handleDisconnect will ignore it
         const oldSocket = this.server.sockets.sockets.get(existingSocketId);
         if (oldSocket && oldSocket.connected) {
           oldSocket.disconnect(true);
         }
       }
 
-      // Update all mappings with new socket
+      // Update all mappings with new socket (may already be set above)
       this.roomsService.setUserSocket(data.memberId, client.id);
       this.roomsService.setUserRoom(data.memberId, data.roomId);
-      this.roomsService.addLoggedInUser(data.memberId, data.name, data.roomId, client.id);
+      this.roomsService.addLoggedInUser(
+        data.memberId,
+        data.name,
+        data.roomId,
+        client.id,
+      );
 
       // Make sure user is in room.members (might have been removed during grace period)
       if (!isAlreadyInRoom) {
@@ -266,13 +285,25 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       // Join the socket.io room
       void client.join(data.roomId);
 
-      const membersWithDetails = this.roomsService.getRoomMembersWithDetails(room.roomId);
+      // Re-fetch room to get latest members after potential modifications
+      const updatedRoom = this.roomsService.findRoomById(data.roomId);
+      const latestMembers = updatedRoom?.members || room.members;
+      const latestMembersWithDetails =
+        this.roomsService.getRoomMembersWithDetails(data.roomId);
 
       client.emit('room-joined', {
         roomId: room.roomId,
         hostId: room.hostId,
-        members: room.members,
-        membersWithDetails,
+        members: latestMembers,
+        membersWithDetails: latestMembersWithDetails,
+      });
+
+      // Broadcast member-joined to sync all clients' member lists
+      client.to(data.roomId).emit('member-joined', {
+        memberId: data.memberId,
+        memberName: data.name,
+        members: latestMembers,
+        membersWithDetails: latestMembersWithDetails,
       });
 
       // Notify host that viewer reconnected (for WebRTC setup)
@@ -376,10 +407,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   }
 
   @SubscribeMessage('spin-result')
-  handleSpinResult(
-    @MessageBody() data: SpinResultDto,
-    @ConnectedSocket() client: Socket,
-  ) {
+  handleSpinResult(@MessageBody() data: SpinResultDto) {
     console.log(`Spin result in ${data.roomId}: ${data.result}`);
     this.server.to(data.roomId).emit('spin-result', data.result);
   }
