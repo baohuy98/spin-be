@@ -36,6 +36,10 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
 
+  // Track pending disconnects with grace period for reconnection
+  private pendingDisconnects: Map<string, NodeJS.Timeout> = new Map();
+  private readonly DISCONNECT_GRACE_PERIOD = 10000; // 10 seconds for page reload
+
   constructor(
     private readonly roomsService: RoomsService,
     private readonly firebaseService: FirebaseService,
@@ -53,16 +57,66 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
 
-    const result = this.roomsService.handleUserDisconnect(userId);
-    if (result) {
-      const roomId = this.roomsService.getUserRoom(userId);
-      if (roomId) {
-        this.server.to(roomId).emit('member-left', {
-          memberId: result.memberId,
-          members: result.members,
-        });
-        console.log(`${userId} left room: ${roomId}`);
+    const roomId = this.roomsService.getUserRoom(userId);
+    const room = roomId ? this.roomsService.findRoomById(roomId) : null;
+    const isHost = room && userId === room.hostId;
+
+    // Use grace period for both host and viewers to handle page reloads
+    console.log(`${isHost ? 'Host' : 'Viewer'} ${userId} disconnected, starting ${this.DISCONNECT_GRACE_PERIOD}ms grace period`);
+
+    // Clear any existing pending disconnect for this user
+    const existingTimeout = this.pendingDisconnects.get(userId);
+    if (existingTimeout) {
+      clearTimeout(existingTimeout);
+    }
+
+    // Set new pending disconnect with grace period
+    const timeout = setTimeout(() => {
+      console.log(`Grace period expired for ${userId}, processing disconnect`);
+      this.pendingDisconnects.delete(userId);
+      this.processUserDisconnect(userId, roomId);
+    }, this.DISCONNECT_GRACE_PERIOD);
+
+    this.pendingDisconnects.set(userId, timeout);
+  }
+
+  // Cancel pending disconnect when user reconnects
+  cancelPendingDisconnect(userId: string): boolean {
+    const timeout = this.pendingDisconnects.get(userId);
+    if (timeout) {
+      clearTimeout(timeout);
+      this.pendingDisconnects.delete(userId);
+      console.log(`Cancelled pending disconnect for ${userId} (reconnected)`);
+      return true;
+    }
+    return false;
+  }
+
+  // Actually process the disconnect (remove from room, clean up)
+  private processUserDisconnect(userId: string, roomId: string | undefined) {
+    // Safety check: if user already reconnected with a new socket, don't process disconnect
+    const currentSocketId = this.roomsService.getUserSocket(userId);
+    if (currentSocketId) {
+      const socket = this.server.sockets.sockets.get(currentSocketId);
+      if (socket && socket.connected) {
+        console.log(`[SKIP] User ${userId} already reconnected with socket ${currentSocketId}, skipping disconnect`);
+        return;
       }
+    }
+
+    const result = this.roomsService.handleUserDisconnect(userId);
+    if (result && roomId) {
+      // Get updated members with details (if room still exists)
+      const membersWithDetails = result.roomDeleted
+        ? []
+        : this.roomsService.getRoomMembersWithDetails(roomId);
+
+      this.server.to(roomId).emit('member-left', {
+        memberId: result.memberId,
+        members: result.members,
+        membersWithDetails,
+      });
+      console.log(`${userId} left room: ${roomId}`);
 
       if (result.roomDeleted) {
         console.log(`Room deleted: ${roomId}`);
@@ -78,49 +132,51 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: CreateRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
-    // Check if host is already in a room
+    // Cancel any pending disconnect for this host (they're reconnecting)
+    this.cancelPendingDisconnect(data.hostId);
+
+    // Check if host already has an existing room (for rejoin scenario)
     const existingRoomId = this.roomsService.getUserRoom(data.hostId);
+    const existingRoom = existingRoomId ? this.roomsService.findRoomById(existingRoomId) : null;
+    const hasExistingViewers = existingRoom && existingRoom.members.length > 1;
+
     if (existingRoomId) {
-      // Check if this is a different socket
+      // Check if this is a different socket (host reconnecting/reloading)
       const existingSocketId = this.roomsService.getUserSocket(data.hostId);
       if (existingSocketId && existingSocketId !== client.id) {
         console.log(`Disconnecting old socket ${existingSocketId} for host ${data.hostId}`);
-        // Disconnect the old socket
+        // Disconnect the old socket without triggering full cleanup
         const oldSocket = this.server.sockets.sockets.get(existingSocketId);
         if (oldSocket) {
-          oldSocket.emit('error', {
-            message: 'You have been disconnected because this account was opened in another tab/window.'
-          });
           oldSocket.disconnect(true);
         }
       }
 
-      // Leave the existing room first
-      const result = this.roomsService.leaveRoom(existingRoomId, data.hostId);
-      if (result) {
-        void client.leave(existingRoomId);
-        this.server.to(existingRoomId).emit('member-left', {
-          memberId: result.memberId,
-          members: result.members,
-        });
-        console.log(
-          `${data.hostId} left previous room ${existingRoomId} to create new room`,
-        );
+      // If there are existing viewers, DON'T delete the room - host is just rejoining
+      if (!hasExistingViewers) {
+        // No viewers, safe to clean up and recreate
+        const result = this.roomsService.leaveRoom(existingRoomId, data.hostId);
+        if (result) {
+          void client.leave(existingRoomId);
+          console.log(`${data.hostId} left empty room ${existingRoomId}`);
+        }
       }
     }
 
+    // Get or create the room
     const room = this.roomsService.createRoom(data.hostId);
     const isRejoining = room.members.length > 1; // More than just host means existing viewers
 
+    // Update host's socket mapping
     this.roomsService.setUserSocket(data.hostId, client.id);
     this.roomsService.setUserRoom(data.hostId, room.roomId);
 
-    // Add host to logged-in users array
+    // Add/update host in logged-in users array
     this.roomsService.addLoggedInUser(data.hostId, data.name, room.roomId, client.id);
 
     void client.join(room.roomId);
 
-    console.log(`Room created: ${room.roomId} by ${data.hostId} (${data.name})`);
+    console.log(`Room created/rejoined: ${room.roomId} by ${data.hostId} (${data.name}), viewers: ${room.members.length - 1}`);
 
     const membersWithDetails = this.roomsService.getRoomMembersWithDetails(room.roomId);
 
@@ -133,7 +189,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // If host is rejoining with existing viewers, notify them to reset WebRTC
     if (isRejoining) {
-      console.log(`Host rejoined room ${room.roomId} with existing viewers, notifying them`);
+      console.log(`Host rejoined room ${room.roomId} with ${room.members.length - 1} existing viewers, notifying them`);
       client.to(room.roomId).emit('host-reconnected', {
         hostId: data.hostId,
         hostSocketId: client.id,
@@ -163,31 +219,41 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       return;
     }
 
-    // Check if user is logged in to this specific room already
+    // Cancel any pending disconnect for this user (they're reconnecting)
+    const wasReconnecting = this.cancelPendingDisconnect(data.memberId);
+
+    // Check if user is already in room.members (they're rejoining/reconnecting)
+    const isAlreadyInRoom = room.members.includes(data.memberId);
+
+    // Check if user is logged in to this specific room
     const isLoggedInToRoom = this.roomsService.isUserLoggedInToRoom(data.memberId, data.roomId);
 
-    if (isLoggedInToRoom) {
-      console.log(`${data.memberId} (${data.name}) is already logged into room ${data.roomId}`);
+    // Handle reconnection: user is in room.members OR was in grace period OR is logged in
+    if (isAlreadyInRoom || wasReconnecting || isLoggedInToRoom) {
+      console.log(`${data.memberId} (${data.name}) reconnecting to room ${data.roomId} [inRoom=${isAlreadyInRoom}, wasReconnecting=${wasReconnecting}, loggedIn=${isLoggedInToRoom}]`);
 
-      // Check if this is a different socket (page reload scenario)
+      // Handle old socket if exists
       const existingSocketId = this.roomsService.getUserSocket(data.memberId);
       if (existingSocketId && existingSocketId !== client.id) {
-        console.log(`Kicking old session for ${data.memberId}, allowing new session`);
-        // Disconnect the old socket
+        console.log(`Updating socket for ${data.memberId}: ${existingSocketId} -> ${client.id}`);
+        // Disconnect the old socket if still connected
         const oldSocket = this.server.sockets.sockets.get(existingSocketId);
-        if (oldSocket) {
-          oldSocket.emit('error', {
-            message: 'You have been disconnected because this account was opened in another tab/window.'
-          });
+        if (oldSocket && oldSocket.connected) {
           oldSocket.disconnect(true);
         }
-
-        // Update the socket mapping to the new connection
-        this.roomsService.setUserSocket(data.memberId, client.id);
-        this.roomsService.updateLoggedInUserSocket(data.memberId, client.id);
       }
 
-      // Always join the socket to the room, regardless of whether it's a new or existing socket
+      // Update all mappings with new socket
+      this.roomsService.setUserSocket(data.memberId, client.id);
+      this.roomsService.setUserRoom(data.memberId, data.roomId);
+      this.roomsService.addLoggedInUser(data.memberId, data.name, data.roomId, client.id);
+
+      // Make sure user is in room.members (might have been removed during grace period)
+      if (!isAlreadyInRoom) {
+        this.roomsService.joinRoom(data.roomId, data.memberId);
+      }
+
+      // Join the socket.io room
       void client.join(data.roomId);
 
       const membersWithDetails = this.roomsService.getRoomMembersWithDetails(room.roomId);
@@ -198,6 +264,17 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         members: room.members,
         membersWithDetails,
       });
+
+      // Notify host that viewer reconnected (for WebRTC setup)
+      if (data.memberId !== room.hostId) {
+        const hostSocketId = this.roomsService.getUserSocket(room.hostId);
+        if (hostSocketId) {
+          this.server.to(hostSocketId).emit('viewer-joined', {
+            viewerId: client.id,
+          });
+        }
+      }
+
       return;
     }
 
@@ -304,8 +381,33 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
   ) {
     console.log(`Host ready to share in room: ${data.roomId}`);
-    // This event signals that host has started screen sharing
-    // Viewers will be notified when they join via viewer-joined event
+
+    // Get all viewers in the room (excluding the host)
+    const room = this.roomsService.findRoomById(data.roomId);
+    if (!room) {
+      console.log(`Room not found: ${data.roomId}`);
+      return;
+    }
+
+    // Get socket IDs of all viewers (members except host)
+    const viewerSocketIds: string[] = [];
+    for (const memberId of room.members) {
+      if (memberId !== room.hostId) {
+        const socketId = this.roomsService.getUserSocket(memberId);
+        if (socketId) {
+          viewerSocketIds.push(socketId);
+        }
+      }
+    }
+
+    console.log(`Existing viewers in room ${data.roomId}:`, viewerSocketIds);
+
+    // Send existing viewers back to host so they can create peer connections
+    if (viewerSocketIds.length > 0) {
+      client.emit('existing-viewers', {
+        viewerIds: viewerSocketIds,
+      });
+    }
   }
 
   @SubscribeMessage('offer')
@@ -365,6 +467,28 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     console.log(`Screen sharing stopped in room: ${data.roomId}`);
     client.to(data.roomId).emit('stop-sharing');
+  }
+
+  @SubscribeMessage('request-stream')
+  handleRequestStream(
+    @MessageBody() data: { roomId: string },
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log(`Viewer ${client.id} requesting stream in room: ${data.roomId}`);
+
+    const room = this.roomsService.findRoomById(data.roomId);
+    if (!room) {
+      console.log(`Room not found: ${data.roomId}`);
+      return;
+    }
+
+    // Forward request to host with viewer's socket ID
+    const hostSocketId = this.roomsService.getUserSocket(room.hostId);
+    if (hostSocketId) {
+      this.server.to(hostSocketId).emit('request-stream', {
+        viewerId: client.id,
+      });
+    }
   }
 
   @SubscribeMessage('send-message')

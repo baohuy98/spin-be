@@ -16,7 +16,7 @@ export type { LoggedInUser };
 
 @Injectable()
 export class RoomsService {
-  constructor(private readonly roomsRepository: RoomsRepository) {}
+  constructor(private readonly roomsRepository: RoomsRepository) { }
 
 
   /**
@@ -43,7 +43,7 @@ export class RoomsService {
       .update(viewerId)
       .digest('hex')
       .substring(0, 16); // Take first 16 characters
-    return `vie      wer-${hash}`;
+    return `viewer-${hash}`;
   }
 
   createRoom(hostId: string): Room {
@@ -53,6 +53,27 @@ export class RoomsService {
     const existingRoom = this.roomsRepository.findRoomById(roomId);
     if (existingRoom) {
       console.log(`[RoomsService] Reusing existing room ${roomId} for host ${hostId}`);
+
+      // Clean up stale members (viewers who are no longer connected)
+      const staleMembers: string[] = [];
+      for (const memberId of existingRoom.members) {
+        if (memberId === hostId) continue; // Skip host
+
+        const socketId = this.roomsRepository.getUserSocket(memberId);
+        if (!socketId) {
+          // No socket mapping = stale member
+          staleMembers.push(memberId);
+        }
+      }
+
+      // Remove stale members
+      for (const staleMemberId of staleMembers) {
+        console.log(`[RoomsService] Removing stale member ${staleMemberId} from room ${roomId}`);
+        this.roomsRepository.removeMemberFromRoom(roomId, staleMemberId);
+        this.roomsRepository.removeLoggedInUser(staleMemberId);
+        this.roomsRepository.deleteUserRoom(staleMemberId);
+      }
+
       // Ensure host is in members list
       if (!existingRoom.members.includes(hostId)) {
         existingRoom.members.push(hostId);
@@ -118,6 +139,17 @@ export class RoomsService {
     // For host leaving: room is deleted
     let roomDeleted = false;
     if (memberId === room.hostId) {
+      // Clean up ALL viewers' data before deleting room
+      // This prevents stale data when host creates room again
+      for (const viewerId of room.members) {
+        if (viewerId !== memberId) {
+          this.roomsRepository.deleteUserSocket(viewerId);
+          this.roomsRepository.deleteUserRoom(viewerId);
+          this.roomsRepository.removeLoggedInUser(viewerId);
+          console.log(`Cleaned up stale viewer data for ${viewerId}`);
+        }
+      }
+
       this.roomsRepository.deleteRoom(roomId);
       roomDeleted = true;
       console.log(`Room ${roomId} deleted because host ${memberId} left`);
