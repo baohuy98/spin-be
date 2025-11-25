@@ -13,9 +13,11 @@ import {
   STORAGE_SERVICE,
   type StorageService,
 } from 'src/storage/interfaces/storage.interface';
+import { v4 } from 'uuid';
 import { CreateRoomDto } from './dto/create-room.dto';
 import { JoinRoomDto } from './dto/join-room.dto';
 import { LeaveRoomDto } from './dto/leave-room.dto';
+import { LivestreamDto } from './dto/livestream-reaction.dto';
 import { SpinResultDto } from './dto/spin-result.dto';
 import { ValidateRoomDto } from './dto/validate-room.dto';
 import {
@@ -526,5 +528,18 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         viewerId: client.id,
       });
     }
+  }
+
+  @SubscribeMessage('livestream-reaction')
+  handleLivestreamReaction(
+    @MessageBody() data: LivestreamDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    client.to(data.roomId).emit('livestream-reaction', {
+      id: v4(),
+      userName: data.userName,
+      emoji: data.emoji,
+      userId: data.userId,
+    });
   }
 }
