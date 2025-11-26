@@ -42,7 +42,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   // Track pending disconnects with grace period for reconnection
   private pendingDisconnects: Map<string, NodeJS.Timeout> = new Map();
-  private readonly DISCONNECT_GRACE_PERIOD = 10000; // 10 seconds for page reload
+  private readonly DISCONNECT_GRACE_PERIOD = 5000; // 10 seconds for page reload
 
   constructor(
     private readonly roomsService: RoomsService,
