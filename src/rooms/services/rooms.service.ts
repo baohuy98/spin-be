@@ -1,10 +1,14 @@
-import { Injectable } from '@nestjs/common';
-import {
-  RoomsRepository,
-  LoggedInUser,
-} from '../repositories/rooms.repository';
-import { Room } from '../entities/room.entity';
+import { Inject, Injectable } from '@nestjs/common';
 import * as crypto from 'crypto';
+import {
+  STORAGE_SERVICE,
+  type StorageService,
+} from 'src/storage/interfaces/storage.interface';
+import { Room } from '../entities/room.entity';
+import {
+  LoggedInUser,
+  RoomsRepository,
+} from '../repositories/rooms.repository';
 
 export interface MemberLeftResult {
   memberId: string;
@@ -16,8 +20,11 @@ export type { LoggedInUser };
 
 @Injectable()
 export class RoomsService {
-  constructor(private readonly roomsRepository: RoomsRepository) { }
-
+  constructor(
+    private readonly roomsRepository: RoomsRepository,
+    @Inject(STORAGE_SERVICE)
+    private readonly storageService: StorageService,
+  ) { }
 
   /**
    * Generate a deterministic room ID based on host ID
@@ -150,6 +157,9 @@ export class RoomsService {
           console.log(`Cleaned up stale viewer data for ${viewerId}`);
         }
       }
+
+      // Clean live chat of room
+      void this.storageService.deleteRoomMessages(roomId);
 
       this.roomsRepository.deleteRoom(roomId);
       roomDeleted = true;
