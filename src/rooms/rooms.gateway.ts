@@ -552,7 +552,6 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: UpdateThemeDto,
     @ConnectedSocket() client: Socket,
   ) {
-    console.log(`[RoomsGateway] Updating theme for room ${data.roomId} to ${data.theme}`);
 
     // Update the room's theme in the service
     const success = this.roomsService.updateRoomTheme(data.roomId, data.theme);
