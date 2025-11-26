@@ -87,6 +87,7 @@ export class RoomsService {
       hostId,
       members: [hostId],
       createdAt: new Date(),
+      theme: 'none', // Default theme
     });
 
     return this.roomsRepository.createRoom(room);
@@ -254,5 +255,16 @@ export class RoomsService {
         isHost: memberId === room.hostId
       };
     });
+  }
+
+  // Update room theme
+  updateRoomTheme(roomId: string, theme: string): boolean {
+    const room = this.roomsRepository.findRoomById(roomId);
+    if (!room) {
+      return false;
+    }
+
+    room.theme = theme;
+    return true;
   }
 }

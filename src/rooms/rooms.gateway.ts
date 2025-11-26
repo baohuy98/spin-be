@@ -19,6 +19,7 @@ import { JoinRoomDto } from './dto/join-room.dto';
 import { LeaveRoomDto } from './dto/leave-room.dto';
 import { LivestreamDto } from './dto/livestream-reaction.dto';
 import { SpinResultDto } from './dto/spin-result.dto';
+import { UpdateThemeDto } from './dto/update-theme.dto';
 import { ValidateRoomDto } from './dto/validate-room.dto';
 import {
   AnswerDto,
@@ -201,6 +202,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       hostId: room.hostId,
       members: room.members,
       membersWithDetails,
+      theme: room.theme || 'none',
     });
 
     // If host is rejoining with existing viewers, notify them to reset WebRTC
@@ -298,6 +300,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         hostId: room.hostId,
         members: latestMembers,
         membersWithDetails: latestMembersWithDetails,
+        theme: room.theme || 'none',
       });
 
       // Broadcast member-joined to sync all clients' member lists
@@ -363,6 +366,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       hostId: updatedRoom.hostId,
       members: updatedRoom.members,
       membersWithDetails,
+      theme: updatedRoom.theme || 'none',
     });
 
     client.to(data.roomId).emit('member-joined', {
@@ -541,5 +545,25 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       emoji: data.emoji,
       userId: data.userId,
     });
+  }
+
+  @SubscribeMessage('update-theme')
+  handleUpdateTheme(
+    @MessageBody() data: UpdateThemeDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log(`[RoomsGateway] Updating theme for room ${data.roomId} to ${data.theme}`);
+
+    // Update the room's theme in the service
+    const success = this.roomsService.updateRoomTheme(data.roomId, data.theme);
+
+    if (success) {
+      // Broadcast the theme change to all members in the room (including the host)
+      this.server.to(data.roomId).emit('theme-updated', {
+        theme: data.theme,
+      });
+    } else {
+      console.error(`[RoomsGateway] Failed to update theme for room ${data.roomId}`);
+    }
   }
 }
