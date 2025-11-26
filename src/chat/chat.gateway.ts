@@ -6,13 +6,14 @@ import {
   WebSocketServer,
 } from '@nestjs/websockets';
 import { Server } from 'socket.io';
-import { v4 as uuidv4 } from 'uuid';
 import {
   STORAGE_SERVICE,
   type StorageService,
 } from 'src/storage/interfaces/storage.interface';
+import { v4 as uuidv4 } from 'uuid';
 import { ReactToMessageDto, SendMessageDto } from './dto/chat.dto';
 import { Message } from './entities/message.entity';
+import { MessageValidationService } from './services/message-validation.service';
 
 @WebSocketGateway({
   cors: {
@@ -27,15 +28,18 @@ export class ChatGateway {
   constructor(
     @Inject(STORAGE_SERVICE)
     private readonly storageService: StorageService,
-  ) {}
+    private readonly messageValidationService: MessageValidationService,
+  ) { }
 
   @SubscribeMessage('send-message')
   async handleSendMessage(@MessageBody() data: SendMessageDto) {
+    const { containsProfanity, cleanedMessage } = this.messageValidationService.validateMessage(data.message);
+
     const message = new Message({
       id: uuidv4(),
       userId: data.userId,
       userName: data.userName,
-      message: data.message,
+      message: containsProfanity ? cleanedMessage : data.message,
       timestamp: Date.now(),
       roomId: data.roomId,
     });
