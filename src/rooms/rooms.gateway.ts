@@ -28,7 +28,18 @@ import {
   OfferDto,
   StopSharingDto,
 } from './dto/webrtc.dto';
+import {
+  GetRouterRtpCapabilitiesDto,
+  CreateTransportDto,
+  ConnectTransportDto,
+  ProduceDto,
+  ConsumeDto,
+  ResumeConsumerDto,
+  GetProducersDto,
+  CloseProducerDto,
+} from './dto/mediasoup.dto';
 import { RoomsService } from './services/rooms.service';
+import { MediasoupService } from './services/mediasoup.service';
 
 @WebSocketGateway({
   cors: {
@@ -46,6 +57,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   constructor(
     private readonly roomsService: RoomsService,
+    private readonly mediasoupService: MediasoupService,
     @Inject(STORAGE_SERVICE)
     private readonly storageService: StorageService,
   ) { }
@@ -124,7 +136,15 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       console.log(`${userId} left room: ${roomId}`);
 
       if (result.roomDeleted) {
-        console.log(`Room deleted: ${roomId}`);
+        console.log(`Room deleted: ${roomId} - notifying remaining members`);
+
+        // Notify all viewers that room is deleted (host left)
+        this.server.to(roomId).emit('room-deleted', {
+          message: 'Host has left the room',
+        });
+
+        // Clean up mediasoup resources for this room
+        this.mediasoupService.closeRoom(roomId);
       }
     }
 
@@ -158,6 +178,16 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         console.log(
           `Host ${data.hostId} reconnecting: ${existingSocketId} -> ${client.id}`,
         );
+
+        // Clean up old mediasoup transports and producers
+        const closedProducerIds = this.mediasoupService.cleanupUserMedia(existingRoomId, existingSocketId);
+        if (closedProducerIds.length > 0) {
+          // Notify all viewers that producers were closed
+          closedProducerIds.forEach(producerId => {
+            this.server.to(existingRoomId).emit('producerClosed', { producerId });
+          });
+        }
+
         // Update socket mapping BEFORE disconnecting old socket
         // This ensures handleDisconnect won't find the old socket's userId
         this.roomsService.setUserSocket(data.hostId, client.id);
@@ -244,6 +274,22 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     // Check if user is already in room.members (they're rejoining/reconnecting)
     const isAlreadyInRoom = room.members.includes(data.memberId);
+
+    // Check for duplicate name (only if not the same user reconnecting)
+    if (!isAlreadyInRoom) {
+      const membersWithDetails = this.roomsService.getRoomMembersWithDetails(data.roomId);
+      const duplicateName = membersWithDetails.find(
+        member => member.name === data.name && member.name !== data.memberId
+      );
+
+      if (duplicateName) {
+        console.log(`Duplicate name detected: ${data.name} already exists in room ${data.roomId}`);
+        client.emit('error', {
+          message: `The name "${data.name}" is already taken in this room. Please choose another name.`
+        });
+        return;
+      }
+    }
 
     // Check if user is logged in to this specific room
     const isLoggedInToRoom = this.roomsService.isUserLoggedInToRoom(data.memberId, data.roomId);
@@ -564,5 +610,161 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     } else {
       console.error(`[RoomsGateway] Failed to update theme for room ${data.roomId}`);
     }
+  }
+
+  // ========== MEDIASOUP SIGNALING HANDLERS ==========
+
+  @SubscribeMessage('getRouterRtpCapabilities')
+  async handleGetRouterRtpCapabilities(
+    @MessageBody() data: GetRouterRtpCapabilitiesDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log(`[Mediasoup] Get router RTP capabilities for room: ${data.roomId}`);
+
+    // Create router if it doesn't exist
+    await this.mediasoupService.createRouter(data.roomId);
+
+    const rtpCapabilities = this.mediasoupService.getRouterRtpCapabilities(data.roomId);
+
+    client.emit('routerRtpCapabilities', { rtpCapabilities });
+  }
+
+  @SubscribeMessage('createTransport')
+  async handleCreateTransport(
+    @MessageBody() data: CreateTransportDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log(`[Mediasoup] Create ${data.direction} transport for room: ${data.roomId}`);
+
+    const transportId = `${client.id}-${data.direction}`;
+    const transportParams = await this.mediasoupService.createWebRtcTransport(
+      data.roomId,
+      transportId,
+    );
+
+    if (transportParams) {
+      client.emit('transportCreated', {
+        direction: data.direction,
+        transportId,
+        ...transportParams,
+      });
+    } else {
+      client.emit('error', { message: 'Failed to create transport' });
+    }
+  }
+
+  @SubscribeMessage('connectTransport')
+  async handleConnectTransport(
+    @MessageBody() data: ConnectTransportDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log(`[Mediasoup] Connect transport: ${data.transportId}`);
+
+    const success = await this.mediasoupService.connectTransport(
+      data.roomId,
+      data.transportId,
+      data.dtlsParameters,
+    );
+
+    if (success) {
+      client.emit('transportConnected', { transportId: data.transportId });
+    } else {
+      client.emit('error', { message: 'Failed to connect transport' });
+    }
+  }
+
+  @SubscribeMessage('produce')
+  async handleProduce(
+    @MessageBody() data: ProduceDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log(`[Mediasoup] Produce ${data.kind} for room: ${data.roomId}`);
+
+    const serverProducerId = await this.mediasoupService.produce(
+      data.roomId,
+      data.transportId,
+      data.kind,
+      data.rtpParameters,
+    );
+
+    if (serverProducerId) {
+      client.emit('produced', { kind: data.kind, id: serverProducerId });
+
+      // Notify all other clients in the room that a new producer is available
+      client.to(data.roomId).emit('newProducer', {
+        producerId: serverProducerId,
+        kind: data.kind,
+      });
+    } else {
+      client.emit('error', { message: 'Failed to produce' });
+    }
+  }
+
+  @SubscribeMessage('consume')
+  async handleConsume(
+    @MessageBody() data: ConsumeDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log(`[Mediasoup] Consume request - Room: ${data.roomId}, TransportId: ${data.transportId}, ProducerId: ${data.producerId}`);
+
+    const consumerParams = await this.mediasoupService.consume(
+      data.roomId,
+      data.transportId,
+      data.producerId,
+      data.rtpCapabilities,
+    );
+
+    if (consumerParams) {
+      console.log(`[Mediasoup] Consumer created successfully: ${consumerParams.id}`);
+      client.emit('consumed', consumerParams);
+    } else {
+      console.error(`[Mediasoup] Failed to consume - Room: ${data.roomId}, Transport: ${data.transportId}, Producer: ${data.producerId}`);
+      client.emit('error', { message: 'Failed to consume' });
+    }
+  }
+
+  @SubscribeMessage('resumeConsumer')
+  async handleResumeConsumer(
+    @MessageBody() data: ResumeConsumerDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log(`[Mediasoup] Resume consumer: ${data.consumerId}`);
+
+    const success = await this.mediasoupService.resumeConsumer(
+      data.roomId,
+      data.consumerId,
+    );
+
+    if (success) {
+      client.emit('consumerResumed', { consumerId: data.consumerId });
+    } else {
+      client.emit('error', { message: 'Failed to resume consumer' });
+    }
+  }
+
+  @SubscribeMessage('getProducers')
+  handleGetProducers(
+    @MessageBody() data: GetProducersDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log(`[Mediasoup] Get producers for room: ${data.roomId}`);
+
+    const producers = this.mediasoupService.getProducers(data.roomId);
+    client.emit('producers', { producers });
+  }
+
+  @SubscribeMessage('closeProducer')
+  handleCloseProducer(
+    @MessageBody() data: CloseProducerDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    console.log(`[Mediasoup] Close producer: ${data.producerId}`);
+
+    this.mediasoupService.closeProducer(data.roomId, data.producerId);
+
+    // Notify all viewers that this producer is closed
+    client.to(data.roomId).emit('producerClosed', {
+      producerId: data.producerId,
+    });
   }
 }
