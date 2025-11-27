@@ -107,6 +107,7 @@ export class MediasoupService implements OnModuleInit {
     await this.createWorkers();
   }
 
+  // count of CPU cores to create equivalent mediasoup workers
   private async createWorkers() {
     const numWorkers = os.cpus().length;
     this.logger.log(`Creating ${numWorkers} mediasoup workers...`);
