@@ -150,7 +150,8 @@ export class MediasoupService implements OnModuleInit {
       consumers: new Map(),
     });
 
-    this.logger.log(`Router created for room: ${roomId}`);
+    this.logger.log(`Router created for room: ${roomId} `);
+    console.log('routers', this.routers);
     return router;
   }
 
@@ -363,8 +364,12 @@ export class MediasoupService implements OnModuleInit {
   }
 
   cleanupUserMedia(roomId: string, oldSocketId: string): string[] {
+    this.logger.log(`[CLEANUP] 🧹 Starting media cleanup for room ${roomId}, oldSocket ${oldSocketId}`);
     const roomRouter = this.routers.get(roomId);
-    if (!roomRouter) return [];
+    if (!roomRouter) {
+      this.logger.warn(`[CLEANUP] ⚠️  Room router not found for ${roomId}`);
+      return [];
+    }
 
     const closedProducerIds: string[] = [];
 
@@ -372,7 +377,7 @@ export class MediasoupService implements OnModuleInit {
     const transportsToDelete: string[] = [];
     roomRouter.transports.forEach((transport, transportId) => {
       if (transportId.startsWith(oldSocketId)) {
-        this.logger.log(`Closing transport for reconnected user: ${transportId}`);
+        this.logger.log(`[CLEANUP] 🚗 Closing transport for reconnected user: ${transportId}`);
         transport.close();
         transportsToDelete.push(transportId);
       }
@@ -384,37 +389,48 @@ export class MediasoupService implements OnModuleInit {
     // So we'll close ALL producers when host reconnects (they'll recreate them)
     if (transportsToDelete.length > 0) {
       roomRouter.producers.forEach((producer, producerId) => {
-        this.logger.log(`Closing producer due to user reconnect: ${producerId}`);
+        this.logger.log(`[CLEANUP] 🎬 Closing producer due to user reconnect: ${producerId}`);
         producer.close();
         closedProducerIds.push(producerId);
       });
       roomRouter.producers.clear();
     }
 
-    this.logger.log(`Cleaned up ${transportsToDelete.length} transports and ${closedProducerIds.length} producers for reconnected user`);
+    this.logger.log(`[CLEANUP] ✅ Cleaned up ${transportsToDelete.length} transports and ${closedProducerIds.length} producers for reconnected user in room ${roomId}`);
     return closedProducerIds;
   }
 
   closeRoom(roomId: string): void {
+    this.logger.log(`[CLOSE-ROOM] 🗑️  Starting room cleanup for ${roomId}`);
     const roomRouter = this.routers.get(roomId);
-    if (!roomRouter) return;
+    if (!roomRouter) {
+      this.logger.warn(`[CLOSE-ROOM] ⚠️  Room router not found for ${roomId}`);
+      return;
+    }
+
+    const consumerCount = roomRouter.consumers.size;
+    const producerCount = roomRouter.producers.size;
+    const transportCount = roomRouter.transports.size;
 
     // Close all consumers
     roomRouter.consumers.forEach((consumer) => consumer.close());
     roomRouter.consumers.clear();
+    this.logger.log(`[CLOSE-ROOM] 🎧 Closed ${consumerCount} consumers`);
 
     // Close all producers
     roomRouter.producers.forEach((producer) => producer.close());
     roomRouter.producers.clear();
+    this.logger.log(`[CLOSE-ROOM] 🎬 Closed ${producerCount} producers`);
 
     // Close all transports
     roomRouter.transports.forEach((transport) => transport.close());
     roomRouter.transports.clear();
+    this.logger.log(`[CLOSE-ROOM] 🚗 Closed ${transportCount} transports`);
 
     // Close router
     roomRouter.router.close();
     this.routers.delete(roomId);
 
-    this.logger.log(`Room closed [roomId:${roomId}]`);
+    this.logger.log(`[CLOSE-ROOM] ✅ Room ${roomId} fully closed (consumers: ${consumerCount}, producers: ${producerCount}, transports: ${transportCount})`);
   }
 }

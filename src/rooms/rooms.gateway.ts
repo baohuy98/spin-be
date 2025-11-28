@@ -63,14 +63,15 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) { }
 
   handleConnection(client: Socket) {
-    console.log(`Client connected: ${client.id}`);
+    console.log(`[CONNECTION] ✅ Client connected: ${client.id}`);
   }
 
   handleDisconnect(client: Socket) {
-    console.log(`Client disconnected: ${client.id}`);
+    console.log(`[DISCONNECT] ⚠️  Client disconnected: ${client.id}`);
 
     const userId = this.roomsService.findUserIdBySocketId(client.id);
     if (!userId) {
+      console.log(`[DISCONNECT] ℹ️  No userId found for socket ${client.id}, ignoring`);
       return;
     }
 
@@ -79,17 +80,18 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const isHost = room && userId === room.hostId;
 
     // Use grace period for both host and viewers to handle page reloads
-    console.log(`${isHost ? 'Host' : 'Viewer'} ${userId} disconnected, starting ${this.DISCONNECT_GRACE_PERIOD}ms grace period`);
+    console.log(`[DISCONNECT] ⏳ ${isHost ? 'Host' : 'Viewer'} ${userId} disconnected from room ${roomId}, starting ${this.DISCONNECT_GRACE_PERIOD}ms grace period`);
 
     // Clear any existing pending disconnect for this user
     const existingTimeout = this.pendingDisconnects.get(userId);
     if (existingTimeout) {
       clearTimeout(existingTimeout);
+      console.log(`[DISCONNECT] 🔄 Cleared existing grace period for ${userId}`);
     }
 
     // Set new pending disconnect with grace period
     const timeout = setTimeout(() => {
-      console.log(`Grace period expired for ${userId}, processing disconnect`);
+      console.log(`[DISCONNECT] ⏰ Grace period expired for ${userId}, processing disconnect`);
       this.pendingDisconnects.delete(userId);
       this.processUserDisconnect(userId, roomId);
     }, this.DISCONNECT_GRACE_PERIOD);
@@ -103,7 +105,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (timeout) {
       clearTimeout(timeout);
       this.pendingDisconnects.delete(userId);
-      console.log(`Cancelled pending disconnect for ${userId} (reconnected)`);
+      console.log(`[RECONNECT] ✅ Cancelled pending disconnect for ${userId} (user reconnected)`);
       return true;
     }
     return false;
@@ -111,12 +113,14 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   // Actually process the disconnect (remove from room, clean up)
   private processUserDisconnect(userId: string, roomId: string | undefined) {
+    console.log(`[DISCONNECT] 🔧 Processing disconnect for ${userId} in room ${roomId}`);
+
     // Safety check: if user already reconnected with a new socket, don't process disconnect
     const currentSocketId = this.roomsService.getUserSocket(userId);
     if (currentSocketId) {
       const socket = this.server.sockets.sockets.get(currentSocketId);
       if (socket && socket.connected) {
-        console.log(`[SKIP] User ${userId} already reconnected with socket ${currentSocketId}, skipping disconnect`);
+        console.log(`[DISCONNECT] ⏭️  User ${userId} already reconnected with socket ${currentSocketId}, skipping disconnect`);
         return;
       }
     }
@@ -133,10 +137,10 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         members: result.members,
         membersWithDetails,
       });
-      console.log(`${userId} left room: ${roomId}`);
+      console.log(`[DISCONNECT] 👋 ${userId} left room: ${roomId}`);
 
       if (result.roomDeleted) {
-        console.log(`Room deleted: ${roomId} - notifying remaining members`);
+        console.log(`[DISCONNECT] 🗑️  Room deleted: ${roomId} (host left) - notifying remaining members`);
 
         // Notify all viewers that room is deleted (host left)
         this.server.to(roomId).emit('room-deleted', {
@@ -144,12 +148,14 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         });
 
         // Clean up mediasoup resources for this room
+        console.log(`[DISCONNECT] 🧹 Cleaning up mediasoup resources for room ${roomId}`);
         this.mediasoupService.closeRoom(roomId);
       }
     }
 
     // Remove from logged-in users
     this.roomsService.removeLoggedInUser(userId);
+    console.log(`[DISCONNECT] ✅ User ${userId} fully disconnected and cleaned up`);
   }
 
   async handleGetChatHistory(client: Socket, roomId: string) {
@@ -163,6 +169,8 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: CreateRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
+    console.log(`[CREATE-ROOM] 📝 Request from hostId=${data.hostId}, name=${data.name}, socket=${client.id}`);
+
     // Cancel any pending disconnect for this host (they're reconnecting)
     this.cancelPendingDisconnect(data.hostId);
 
@@ -172,19 +180,23 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     const hasExistingViewers = existingRoom && existingRoom.members.length > 1;
 
     if (existingRoomId) {
+      console.log(`[CREATE-ROOM] 🔍 Host ${data.hostId} already has room ${existingRoomId} with ${existingRoom?.members.length || 0} members`);
+
       // Check if this is a different socket (host reconnecting/reloading)
       const existingSocketId = this.roomsService.getUserSocket(data.hostId);
       if (existingSocketId && existingSocketId !== client.id) {
         console.log(
-          `Host ${data.hostId} reconnecting: ${existingSocketId} -> ${client.id}`,
+          `[CREATE-ROOM] 🔄 Host ${data.hostId} reconnecting: ${existingSocketId} -> ${client.id}`,
         );
 
         // Clean up old mediasoup transports and producers
         const closedProducerIds = this.mediasoupService.cleanupUserMedia(existingRoomId, existingSocketId);
         if (closedProducerIds.length > 0) {
+          console.log(`[CREATE-ROOM] 🧹 Cleaned up ${closedProducerIds.length} producers: ${closedProducerIds.join(', ')}`);
           // Notify all viewers that producers were closed
           closedProducerIds.forEach(producerId => {
             this.server.to(existingRoomId).emit('producerClosed', { producerId });
+            console.log(`[CREATE-ROOM] 📤 Sent producerClosed event for ${producerId} to room ${existingRoomId}`);
           });
         }
 
@@ -196,17 +208,21 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         const oldSocket = this.server.sockets.sockets.get(existingSocketId);
         if (oldSocket) {
           oldSocket.disconnect(true);
+          console.log(`[CREATE-ROOM] 🔌 Disconnected old socket ${existingSocketId}`);
         }
       }
 
       // If there are existing viewers, DON'T delete the room - host is just rejoining
       if (!hasExistingViewers) {
         // No viewers, safe to clean up and recreate
+        console.log(`[CREATE-ROOM] 🧹 No viewers in room ${existingRoomId}, cleaning up`);
         const result = this.roomsService.leaveRoom(existingRoomId, data.hostId);
         if (result) {
           void client.leave(existingRoomId);
-          console.log(`${data.hostId} left empty room ${existingRoomId}`);
+          console.log(`[CREATE-ROOM] 👋 ${data.hostId} left empty room ${existingRoomId}`);
         }
+      } else {
+        console.log(`[CREATE-ROOM] 👥 Keeping room ${existingRoomId} with ${existingRoom.members.length - 1} existing viewers`);
       }
     }
 
@@ -223,7 +239,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     void client.join(room.roomId);
 
-    console.log(`Room created/rejoined: ${room.roomId} by ${data.hostId} (${data.name}), viewers: ${room.members.length - 1}`);
+    console.log(`[CREATE-ROOM] ✅ Room ${isRejoining ? 'rejoined' : 'created'}: ${room.roomId} by ${data.hostId} (${data.name}), viewers: ${room.members.length - 1}`);
 
     const membersWithDetails = this.roomsService.getRoomMembersWithDetails(room.roomId);
 
@@ -234,10 +250,11 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       membersWithDetails,
       theme: room.theme || 'none',
     });
+    console.log(`[CREATE-ROOM] 📤 Sent room-created event to host ${client.id}`);
 
     // If host is rejoining with existing viewers, notify them to reset WebRTC
     if (isRejoining) {
-      console.log(`Host rejoined room ${room.roomId} with ${room.members.length - 1} existing viewers, notifying them`);
+      console.log(`[CREATE-ROOM] 🔔 Host rejoined room ${room.roomId} with ${room.members.length - 1} existing viewers, sending host-reconnected event`);
       client.to(room.roomId).emit('host-reconnected', {
         hostId: data.hostId,
         hostSocketId: client.id,
@@ -261,13 +278,17 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: JoinRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
+    console.log(`[JOIN-ROOM] 📝 Request from memberId=${data.memberId}, name=${data.name}, roomId=${data.roomId}, socket=${client.id}`);
+
     const room = this.roomsService.findRoomById(data.roomId);
 
     if (!room) {
-      console.log(`Room not found: ${data.roomId}`);
+      console.log(`[JOIN-ROOM] ❌ Room not found: ${data.roomId}`);
       client.emit('error', { message: 'Room not found' });
       return;
     }
+
+    console.log(`[JOIN-ROOM] 🔍 Room ${data.roomId} found with ${room.members.length} members (host: ${room.hostId})`);
 
     // Cancel any pending disconnect for this user (they're reconnecting)
     const wasReconnecting = this.cancelPendingDisconnect(data.memberId);
@@ -283,7 +304,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       );
 
       if (duplicateName) {
-        console.log(`Duplicate name detected: ${data.name} already exists in room ${data.roomId}`);
+        console.log(`[JOIN-ROOM] ❌ Duplicate name detected: ${data.name} already exists in room ${data.roomId}`);
         client.emit('error', {
           message: `The name "${data.name}" is already taken in this room. Please choose another name.`
         });
@@ -297,14 +318,14 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     // Handle reconnection: user is in room.members OR was in grace period OR is logged in
     if (isAlreadyInRoom || wasReconnecting || isLoggedInToRoom) {
       console.log(
-        `${data.memberId} (${data.name}) reconnecting to room ${data.roomId} [inRoom=${isAlreadyInRoom}, wasReconnecting=${wasReconnecting}, loggedIn=${isLoggedInToRoom}]`,
+        `[JOIN-ROOM] 🔄 ${data.memberId} (${data.name}) reconnecting to room ${data.roomId} [inRoom=${isAlreadyInRoom}, wasReconnecting=${wasReconnecting}, loggedIn=${isLoggedInToRoom}]`,
       );
 
       // Handle old socket if exists
       const existingSocketId = this.roomsService.getUserSocket(data.memberId);
       if (existingSocketId && existingSocketId !== client.id) {
         console.log(
-          `Viewer ${data.memberId} reconnecting: ${existingSocketId} -> ${client.id}`,
+          `[JOIN-ROOM] 🔄 Viewer ${data.memberId} reconnecting: ${existingSocketId} -> ${client.id}`,
         );
         // Update socket mapping BEFORE disconnecting old socket
         // This ensures handleDisconnect won't find the old socket's userId
@@ -314,6 +335,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         const oldSocket = this.server.sockets.sockets.get(existingSocketId);
         if (oldSocket && oldSocket.connected) {
           oldSocket.disconnect(true);
+          console.log(`[JOIN-ROOM] 🔌 Disconnected old socket ${existingSocketId}`);
         }
       }
 
@@ -329,6 +351,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
       // Make sure user is in room.members (might have been removed during grace period)
       if (!isAlreadyInRoom) {
+        console.log(`[JOIN-ROOM] 📝 Adding ${data.memberId} back to room.members`);
         this.roomsService.joinRoom(data.roomId, data.memberId);
       }
 
@@ -348,6 +371,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         membersWithDetails: latestMembersWithDetails,
         theme: room.theme || 'none',
       });
+      console.log(`[JOIN-ROOM] 📤 Sent room-joined event to ${client.id}`);
 
       // Broadcast member-joined to sync all clients' member lists
       client.to(data.roomId).emit('member-joined', {
@@ -356,6 +380,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         members: latestMembers,
         membersWithDetails: latestMembersWithDetails,
       });
+      console.log(`[JOIN-ROOM] 📤 Sent member-joined event to room ${data.roomId}`);
 
       // Notify host that viewer reconnected (for WebRTC setup)
       if (data.memberId !== room.hostId) {
@@ -364,16 +389,19 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
           this.server.to(hostSocketId).emit('viewer-joined', {
             viewerId: client.id,
           });
+          console.log(`[JOIN-ROOM] 📤 Sent viewer-joined event to host ${hostSocketId}`);
         }
       }
 
       void this.handleGetChatHistory(client, data.roomId);
+      console.log(`[JOIN-ROOM] ✅ ${data.memberId} (${data.name}) successfully reconnected to room ${data.roomId}`);
       return;
     }
 
     // Check if user is already in a different room
     const existingRoomId = this.roomsService.getUserRoom(data.memberId);
     if (existingRoomId && existingRoomId !== data.roomId) {
+      console.log(`[JOIN-ROOM] 🔄 ${data.memberId} is in different room ${existingRoomId}, leaving it first`);
       // Leave the existing room first
       const result = this.roomsService.leaveRoom(existingRoomId, data.memberId);
       if (result) {
@@ -383,14 +411,16 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
           members: result.members,
         });
         console.log(
-          `${data.memberId} left previous room ${existingRoomId} to join ${data.roomId}`,
+          `[JOIN-ROOM] 👋 ${data.memberId} left previous room ${existingRoomId} to join ${data.roomId}`,
         );
       }
     }
 
     // Add member to room
+    console.log(`[JOIN-ROOM] 📝 Adding new member ${data.memberId} (${data.name}) to room ${data.roomId}`);
     const updatedRoom = this.roomsService.joinRoom(data.roomId, data.memberId);
     if (!updatedRoom) {
+      console.log(`[JOIN-ROOM] ❌ Failed to join room ${data.roomId}`);
       client.emit('error', { message: 'Failed to join room' });
       return;
     }
@@ -403,7 +433,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     void client.join(data.roomId);
 
-    console.log(`${data.memberId} (${data.name}) joined room: ${data.roomId}`);
+    console.log(`[JOIN-ROOM] ✅ ${data.memberId} (${data.name}) joined room: ${data.roomId} (total members: ${updatedRoom.members.length})`);
 
     const membersWithDetails = this.roomsService.getRoomMembersWithDetails(data.roomId);
 
@@ -414,6 +444,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       membersWithDetails,
       theme: updatedRoom.theme || 'none',
     });
+    console.log(`[JOIN-ROOM] 📤 Sent room-joined event to ${client.id}`);
 
     client.to(data.roomId).emit('member-joined', {
       memberId: data.memberId,
@@ -421,6 +452,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
       members: updatedRoom.members,
       membersWithDetails,
     });
+    console.log(`[JOIN-ROOM] 📤 Sent member-joined broadcast to room ${data.roomId}`);
 
     // Notify host that a new viewer joined (for WebRTC setup)
     if (data.memberId !== updatedRoom.hostId) {
@@ -429,6 +461,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         this.server.to(hostSocketId).emit('viewer-joined', {
           viewerId: client.id,
         });
+        console.log(`[JOIN-ROOM] 📤 Sent viewer-joined event to host ${hostSocketId}`);
       }
     }
 
@@ -440,15 +473,18 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: LeaveRoomDto,
     @ConnectedSocket() client: Socket,
   ) {
+    console.log(`[LEAVE-ROOM] 📝 Request from memberId=${data.memberId}, roomId=${data.roomId}, socket=${client.id}`);
+
     const result = this.roomsService.leaveRoom(data.roomId, data.memberId);
     if (result) {
       this.server.to(data.roomId).emit('member-left', {
         memberId: result.memberId,
         members: result.members,
       });
+      console.log(`[LEAVE-ROOM] 📤 Sent member-left event to room ${data.roomId}`);
 
       if (result.roomDeleted) {
-        console.log(`Room deleted: ${data.roomId}`);
+        console.log(`[LEAVE-ROOM] 🗑️  Room deleted: ${data.roomId} (host left)`);
       }
     }
 
@@ -456,6 +492,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     this.roomsService.deleteUserRoom(data.memberId);
     this.roomsService.removeLoggedInUser(data.memberId);
     void client.leave(data.roomId);
+    console.log(`[LEAVE-ROOM] ✅ ${data.memberId} left room ${data.roomId} and cleaned up`);
   }
 
   @SubscribeMessage('spin-result')
@@ -505,12 +542,13 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
   ) {
     console.log(
-      `Offer received for room: ${data.roomId}, sending to: ${data.to}`,
+      `[WEBRTC] 📡 Offer received from ${client.id} for room ${data.roomId}, sending to ${data.to}`,
     );
     this.server.to(data.to).emit('offer', {
       offer: data.offer,
       from: client.id,
     });
+    console.log(`[WEBRTC] 📤 Sent offer to ${data.to}`);
   }
 
   @SubscribeMessage('answer')
@@ -518,12 +556,13 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: AnswerDto,
     @ConnectedSocket() client: Socket,
   ) {
-    console.log(`Answer received from: ${client.id}`);
+    console.log(`[WEBRTC] 📡 Answer received from ${client.id} for room ${data.roomId}`);
     // Send answer to all room members (host will filter it)
     client.to(data.roomId).emit('answer', {
       answer: data.answer,
       from: client.id,
     });
+    console.log(`[WEBRTC] 📤 Sent answer broadcast to room ${data.roomId}`);
   }
 
   @SubscribeMessage('ice-candidate')
@@ -532,7 +571,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @ConnectedSocket() client: Socket,
   ) {
     console.log(
-      `ICE candidate from ${client.id}, to: ${data.to || 'broadcast'}`,
+      `[WEBRTC] 🧊 ICE candidate from ${client.id}, to: ${data.to || 'broadcast to room ' + data.roomId}`,
     );
     if (data.to) {
       // Send to specific peer
@@ -540,12 +579,14 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         candidate: data.candidate,
         from: client.id,
       });
+      console.log(`[WEBRTC] 📤 Sent ICE candidate to ${data.to}`);
     } else {
       // Broadcast to room (for viewers sending to host)
       client.to(data.roomId).emit('ice-candidate', {
         candidate: data.candidate,
         from: client.id,
       });
+      console.log(`[WEBRTC] 📤 Sent ICE candidate broadcast to room ${data.roomId}`);
     }
   }
 
@@ -554,8 +595,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: StopSharingDto,
     @ConnectedSocket() client: Socket,
   ) {
-    console.log(`Screen sharing stopped in room: ${data.roomId}`);
+    console.log(`[WEBRTC] 🛑 Screen sharing stopped in room ${data.roomId} by ${client.id}`);
     client.to(data.roomId).emit('stop-sharing');
+    console.log(`[WEBRTC] 📤 Sent stop-sharing event to room ${data.roomId}`);
   }
 
   @SubscribeMessage('request-stream')
@@ -619,14 +661,14 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: GetRouterRtpCapabilitiesDto,
     @ConnectedSocket() client: Socket,
   ) {
-    console.log(`[Mediasoup] Get router RTP capabilities for room: ${data.roomId}`);
+    console.log(`[MEDIASOUP] 🎛️  Get router RTP capabilities for room ${data.roomId} from ${client.id}`);
 
     // Create router if it doesn't exist
     await this.mediasoupService.createRouter(data.roomId);
 
     const rtpCapabilities = this.mediasoupService.getRouterRtpCapabilities(data.roomId);
-
     client.emit('routerRtpCapabilities', { rtpCapabilities });
+    console.log(`[MEDIASOUP] 📤 Sent router RTP capabilities to ${client.id}`);
   }
 
   @SubscribeMessage('createTransport')
@@ -634,7 +676,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: CreateTransportDto,
     @ConnectedSocket() client: Socket,
   ) {
-    console.log(`[Mediasoup] Create ${data.direction} transport for room: ${data.roomId}`);
+    console.log(`[MEDIASOUP] 🚗 Create ${data.direction} transport for room ${data.roomId} from ${client.id}`);
 
     const transportId = `${client.id}-${data.direction}`;
     const transportParams = await this.mediasoupService.createWebRtcTransport(
@@ -648,7 +690,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
         transportId,
         ...transportParams,
       });
+      console.log(`[MEDIASOUP] ✅ Created ${data.direction} transport ${transportId} for ${client.id}`);
     } else {
+      console.log(`[MEDIASOUP] ❌ Failed to create ${data.direction} transport for ${client.id}`);
       client.emit('error', { message: 'Failed to create transport' });
     }
   }
@@ -658,7 +702,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: ConnectTransportDto,
     @ConnectedSocket() client: Socket,
   ) {
-    console.log(`[Mediasoup] Connect transport: ${data.transportId}`);
+    console.log(`[MEDIASOUP] 🔗 Connect transport ${data.transportId} from ${client.id}`);
 
     const success = await this.mediasoupService.connectTransport(
       data.roomId,
@@ -668,7 +712,9 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     if (success) {
       client.emit('transportConnected', { transportId: data.transportId });
+      console.log(`[MEDIASOUP] ✅ Transport ${data.transportId} connected for ${client.id}`);
     } else {
+      console.log(`[MEDIASOUP] ❌ Failed to connect transport ${data.transportId}`);
       client.emit('error', { message: 'Failed to connect transport' });
     }
   }
@@ -678,7 +724,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     @MessageBody() data: ProduceDto,
     @ConnectedSocket() client: Socket,
   ) {
-    console.log(`[Mediasoup] Produce ${data.kind} for room: ${data.roomId}`);
+    console.log(`[MEDIASOUP] 🎬 Produce ${data.kind} for room ${data.roomId} from ${client.id}`);
 
     const serverProducerId = await this.mediasoupService.produce(
       data.roomId,
@@ -689,13 +735,16 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
     if (serverProducerId) {
       client.emit('produced', { kind: data.kind, id: serverProducerId });
+      console.log(`[MEDIASOUP] ✅ Producer created: ${serverProducerId} (${data.kind}) for ${client.id}`);
 
       // Notify all other clients in the room that a new producer is available
       client.to(data.roomId).emit('newProducer', {
         producerId: serverProducerId,
         kind: data.kind,
       });
+      console.log(`[MEDIASOUP] 📤 Sent newProducer event to room ${data.roomId} for producer ${serverProducerId}`);
     } else {
+      console.log(`[MEDIASOUP] ❌ Failed to produce ${data.kind} for ${client.id}`);
       client.emit('error', { message: 'Failed to produce' });
     }
   }

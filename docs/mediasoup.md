@@ -1,222 +1,598 @@
-# Mediasoup Architecture Documentation
+# Mediasoup Complete Workflow Documentation
 
 > [!NOTE]
-> Tài liệu này mô tả chi tiết về kiến trúc **SFU (Selective Forwarding Unit)** sử dụng WebRTC và Mediasoup để giải quyết vấn đề quá tải băng thông và CPU.
+> Mediasoup is a Selective Forwarding Unit (SFU) - the server receives media from the host and forwards it to viewers without transcoding. Think of it as a smart media router.
+
+```
+Host (Producer) → Mediasoup Server → Viewers (Consumers)
+     [Sends media]    [Forwards]      [Receive media]
+```
 
 ---
 
-## 📋 Tổng Quan
+## 📋 Complete Workflow Step-by-Step
 
-Hệ thống được chia thành hai phần chính:
-- **Server-side**: NestJS + Mediasoup 
-- **Client-side**: React + Mediasoup-Client
+### PHASE 1: Initial Setup (Both Host & Viewer)
 
----
+#### 1️⃣ Get Router RTP Capabilities
 
-## 1️⃣ Server-Side Methods
+**Location:** `useMediasoupWebRTC.ts:52-64`
 
-> Files: `mediasoup.service.ts`, `rooms.gateway.ts`
+**What happens:**
 
-### Core Methods
+```javascript
+// FE sends:
+socket.emit('getRouterRtpCapabilities', { roomId })
 
-| Phương Thức | File | Chức Năng |
-|------------|------|-----------|
-| `createRoomRouter()` | mediasoup.service.ts | **Tạo môi trường phòng**: Chọn Worker (tiến trình Mediasoup C++) và khởi tạo Router - trái tim của phòng, quản lý tất cả luồng media (Producers/Consumers) |
-| `getRouterRtpCapabilities()` | mediasoup.service.ts | **Cung cấp cấu hình**: Trả về danh sách codec và tham số RTP mà Router hỗ trợ, cần thiết cho client cấu hình Device |
-| `createWebRtcTransport()` | mediasoup.service.ts | **Thiết lập kết nối**: Tạo WebRtcTransport cho client (Host/Viewer) để gửi/nhận media, quản lý kết nối ICE/DTLS/SRTP |
-| `connectTransport()` | mediasoup.service.ts | **Hoàn tất kết nối**: Hoàn tất handshake DTLS với thông số từ client, bước cuối để Transport sẵn sàng |
-| `produce()` | mediasoup.service.ts | **Xuất bản luồng**: Tạo Producer đại diện cho luồng media từ client lên server |
-| `consume()` | mediasoup.service.ts | **Tiêu thụ luồng**: Tạo Consumer để gửi media từ server xuống Viewer - cơ chế SFU forwarding |
-| `resumeConsumer()` | mediasoup.service.ts | **Khởi động luồng**: Unpause Consumer để bắt đầu gửi gói tin media |
-| `closeProducer()`<br>`closeConsumer()`<br>`closeRoom()` | mediasoup.service.ts | **Dọn dẹp tài nguyên**: Đóng các luồng, transport, hoặc toàn bộ router khi ngắt kết nối |
+// BE receives (rooms.gateway.ts:659):
+@SubscribeMessage('getRouterRtpCapabilities')
+  - Creates router if doesn't exist
+  - Gets router's supported codecs (VP8, VP9, H264, Opus)
 
----
+// BE sends back:
+socket.emit('routerRtpCapabilities', { rtpCapabilities })
 
-## 2️⃣ Client-Side Methods
+// FE receives:
+socket.on('routerRtpCapabilities', (data) => {
+  device.load({ routerRtpCapabilities: data.rtpCapabilities })
+})
+```
 
-> File: `useMediasoupWebRTC.ts`
+**Purpose:** The client learns what audio/video formats the server supports.
 
-### Core Methods
-
-| Phương Thức | File | Chức Năng |
-|------------|------|-----------|
-| `device.load()` | useMediasoupWebRTC.ts | **Khởi tạo Device**: Load Device với routerRtpCapabilities từ server, xác định codec hỗ trợ |
-| `device.createSendTransport()` | useMediasoupWebRTC.ts | **Tạo Transport Gửi**: Khởi tạo Transport client-side để gửi media lên server |
-| `device.createRecvTransport()` | useMediasoupWebRTC.ts | **Tạo Transport Nhận**: Khởi tạo Transport client-side để nhận media từ server |
-| `sendTransport.produce()` | useMediasoupWebRTC.ts | **Kích hoạt gửi**: Gửi MediaStreamTrack qua Transport, trigger sự kiện `on('produce')` |
-| `recvTransport.consume()` | useMediasoupWebRTC.ts | **Kích hoạt nhận**: Bắt đầu nhận luồng media từ server dựa trên producerId |
+**Logs:**
+```
+[FE-MEDIASOUP] 📤 Requesting router RTP capabilities for room: abc123
+[MEDIASOUP] 🎛️ Get router RTP capabilities for room abc123
+[MEDIASOUP] 📤 Sent router RTP capabilities
+[FE-MEDIASOUP] ✅ Received router RTP capabilities, loading device...
+[FE-MEDIASOUP] ✅ Device loaded successfully
+```
 
 ---
 
-## 3️⃣ Workflow Chi Tiết
+### PHASE 2: Transport Creation
 
 > [!IMPORTANT]
-> Luồng làm việc sử dụng **Socket.IO** cho signaling và **WebRTC/Mediasoup** cho media transport
+> Transports are bidirectional pipes for media:
+> - **Send Transport** (host → server): For sending media
+> - **Receive Transport** (server → viewer): For receiving media
 
-### Phase 1: Khởi Tạo (Initialization)
+#### 2️⃣ Create WebRTC Transport
 
-#### 🏠 Host Tạo Phòng
-1. **Client**: Host kết nối Socket.IO → gửi event `createRoom`
-2. **Server**: Tạo phòng trong `rooms.service` → gọi `mediasoupService.createRoomRouter()`
+**Location:** `useMediasoupWebRTC.ts:215-255` (event handler)
 
-#### 📱 Khởi Tạo Client Device
-1. **Client**: Gửi event `getRouterRtpCapabilities`
-2. **Server**: Gọi `mediasoupService.getRouterRtpCapabilities()` → trả về capabilities
-3. **Client**: Tạo Device → gọi `device.load()` với capabilities nhận được
+**What happens:**
+
+```javascript
+// FE sends:
+socket.emit('createTransport', {
+  roomId: 'abc123',
+  direction: 'send' // or 'recv'
+})
+
+// BE receives (rooms.gateway.ts:675):
+@SubscribeMessage('createTransport')
+  - Creates WebRTC transport on router
+  - transportId = `${client.id}-${direction}`
+    Example: "socketId123-send"
+
+// BE creates transport with:
+{
+  id: transport.id,              // mediasoup's internal ID
+  iceParameters: {...},          // For ICE connection
+  iceCandidates: [...],          // Server's network addresses
+  dtlsParameters: {...}          // For DTLS encryption
+}
+
+// BE sends back:
+socket.emit('transportCreated', {
+  direction: 'send',
+  transportId: 'socketId123-send',
+  ...transportParams
+})
+
+// FE receives and creates local transport:
+const transport = device.createSendTransport({
+  id: data.id,
+  iceParameters: data.iceParameters,
+  iceCandidates: data.iceCandidates,
+  dtlsParameters: data.dtlsParameters,
+})
+```
+
+**Purpose:** Creates the media pipe between client and server.
+
+- **Host creates:** Send transport (to send screen/audio)
+- **Viewer creates:** Receive transport (to receive stream)
+
+**Logs:**
+```
+[FE-MEDIASOUP] 🚗 Creating send transport...
+[MEDIASOUP] 🚗 Create send transport for room abc123 from socketId123
+[MEDIASOUP] ✅ Created send transport socketId123-send
+[FE-MEDIASOUP] ✅ Send transport created
+```
 
 ---
 
-### Phase 2: Host Xuất Bản (Publishing)
+#### 3️⃣ Connect Transport
 
-#### 🔄 Bước 1: Tạo Transport Gửi
-1. **Client**: Host gửi event `createTransport` (với `isProducer: true`)
-2. **Server**: Gọi `mediasoupService.createWebRtcTransport()` → trả về Transport params (ID, ICE/DTLS info)
-3. **Client**: Gọi `device.createSendTransport()`
+**Location:** `useMediasoupWebRTC.ts:229` (transport.on('connect'))
 
-#### 🔗 Bước 2: Kết Nối Transport
-1. **Client**: Trigger `sendTransport.on('connect')` → gửi DTLS params qua event `connectTransport`
-2. **Server**: Gọi `mediasoupService.connectTransport()` → hoàn tất kết nối
+**What happens:**
 
-#### 📹 Bước 3: Tạo Producer
-1. **Client**: Host bắt đầu chia sẻ (VD: `navigator.mediaDevices.getDisplayMedia()`)
-2. **Client**: Gọi `sendTransport.produce()` cho video/audio track
-3. **Client**: Event `sendTransport.on('produce')` → gửi RTP params qua event `produce`
-4. **Server**: Gọi `mediasoupService.produce()` → tạo và lưu Producer
-5. **Server**: Broadcast event `newProducer` đến tất cả Viewers
+```javascript
+// FE: When transport needs to connect, it fires event
+transport.on('connect', async ({ dtlsParameters }, callback) => {
+  // FE sends DTLS params to server:
+  socket.emit('connectTransport', {
+    roomId,
+    transportId: 'socketId123-send',
+    dtlsParameters
+  })
+
+  // BE receives (rooms.gateway.ts:701):
+  @SubscribeMessage('connectTransport')
+    - Finds transport by ID
+    - Calls: await transport.connect({ dtlsParameters })
+    - This establishes the encrypted connection
+
+  // BE sends back:
+  socket.emit('transportConnected', { transportId })
+
+  // FE receives and completes connection:
+  callback() // Tells transport "connection successful"
+})
+```
+
+**Purpose:** Establishes the encrypted WebRTC connection (DTLS handshake).
+
+**Logs:**
+```
+[MEDIASOUP] 🔗 Connect transport socketId123-send from socketId123
+[MEDIASOUP] ✅ Transport socketId123-send connected
+```
 
 ---
 
-### Phase 3: Viewer Tiêu Thụ (Consuming)
+### PHASE 3: Media Production (HOST ONLY)
 
-#### 🔄 Bước 1: Tạo Transport Nhận
-1. **Client**: Viewer nhận `newProducer` → gửi event `createTransport` (với `isProducer: false`)
-2. **Server**: Gọi `mediasoupService.createWebRtcTransport()` → trả về Transport params
-3. **Client**: Gọi `device.createRecvTransport()`
+#### 4️⃣ Produce Media (Host Sends Video/Audio)
 
-#### 🔗 Bước 2: Kết Nối Transport
-- Tương tự Phase 2 - Bước 2
+**Location:**
+- FE: `useMediasoupWebRTC.ts:77-108` (produceMedia function)
+- FE: `useMediasoupWebRTC.ts:236-244` (transport produce event)
 
-#### 📺 Bước 3: Tạo Consumer và Nhận Media
-1. **Client**: Viewer gửi event `consume` với `producerId` của Host
-2. **Server**: Gọi `mediasoupService.consume()` → tạo Consumer liên kết với Producer
-3. **Server**: Trả về Consumer params (ID, RTP)
-4. **Client**: Gọi `recvTransport.consume()` → tạo MediaStreamTrack cục bộ
-5. **Client**: Gửi event `resumeConsumer`
-6. **Server**: Gọi `mediasoupService.resumeConsumer()` → bắt đầu streaming
-7. **Client**: Hiển thị luồng video
+**What happens:**
+
+```javascript
+// HOST: Gets screen share stream
+const stream = await navigator.mediaDevices.getDisplayMedia({
+  video: true,
+  audio: true
+})
+
+// HOST: For each track (video, audio), produces to transport
+const videoTrack = stream.getVideoTracks()[0]
+
+// FE: Transport fires 'produce' event
+sendTransport.on('produce', async ({ kind, rtpParameters }, callback) => {
+  // FE sends track info to server:
+  socket.emit('produce', {
+    roomId: 'abc123',
+    transportId: 'socketId123-send',
+    kind: 'video',           // 'video' or 'audio'
+    rtpParameters: {...}     // Codec params, encoding settings
+  })
+
+  // BE receives (rooms.gateway.ts:723):
+  @SubscribeMessage('produce')
+    - Finds send transport
+    - Creates producer: await transport.produce({ kind, rtpParameters })
+    - Stores producer: roomRouter.producers.set(producerId, producer)
+    - Returns producer ID
+
+  // BE broadcasts to ALL OTHER clients in room:
+  socket.to(roomId).emit('newProducer', {
+    producerId: 'producer-abc-123',
+    kind: 'video'
+  })
+
+  // BE sends back to host:
+  socket.emit('produced', {
+    kind: 'video',
+    id: 'producer-abc-123'
+  })
+
+  // FE receives producer ID:
+  callback({ id: serverProducerId })
+})
+```
+
+**Purpose:** Host sends media tracks to server. Server stores them and notifies viewers.
+
+> [!TIP]
+> **Key Point:** The server now has the host's video/audio streams ready to forward to viewers!
+
+**Logs:**
+```
+[FE-MEDIASOUP] 🎬 Starting media production...
+[FE-MEDIASOUP] 📹 Producing video track...
+[MEDIASOUP] 🎬 Produce video for room abc123 from socketId123
+[MEDIASOUP] ✅ Producer created: producer-abc-123 (video)
+[MEDIASOUP] 📤 Sent newProducer event to room abc123
+```
 
 ---
 
-## 4️⃣ Sơ Đồ Kiến Trúc
+### PHASE 4: Media Consumption (VIEWER ONLY)
+
+#### 5️⃣ Get Available Producers (Viewer Discovers Streams)
+
+**Location:** `useMediasoupWebRTC.ts:63` & `useMediasoupWebRTC.ts:390-407`
+
+**What happens:**
+
+```javascript
+// VIEWER: After device loads, asks for available producers
+socket.emit('getProducers', { roomId: 'abc123' })
+
+// BE receives (rooms.gateway.ts:745):
+@SubscribeMessage('getProducers')
+  - Gets all producers in room
+  - Returns list: ['producer-abc-123', 'producer-def-456']
+
+// BE sends back:
+socket.emit('producers', {
+  producers: [
+    { id: 'producer-abc-123', kind: 'video' },
+    { id: 'producer-def-456', kind: 'audio' }
+  ]
+})
+
+// FE receives:
+socket.on('producers', (data) => {
+  // For each producer, start consuming
+  data.producers.forEach(({ id }) => {
+    consumeMedia(id)
+  })
+})
+```
+
+**Purpose:** Viewer discovers what media streams are available from the host.
+
+**Logs:**
+```
+[FE-MEDIASOUP] 📤 Viewer requesting existing producers
+[MEDIASOUP] Get producers for room abc123
+[FE-MEDIASOUP] 📋 Received X existing producers
+```
+
+---
+
+#### 6️⃣ Consume Media (Viewer Receives Stream)
+
+**Location:**
+- FE: `useMediasoupWebRTC.ts:105-208` (consumeMedia function)
+- BE: `rooms.gateway.ts:753` (consume handler)
+
+**What happens:**
+
+```javascript
+// VIEWER: Requests to consume a specific producer
+socket.emit('consume', {
+  roomId: 'abc123',
+  transportId: 'viewerSocketId-recv',
+  producerId: 'producer-abc-123',
+  rtpCapabilities: device.rtpCapabilities  // What viewer can decode
+})
+
+// BE receives (rooms.gateway.ts:753):
+@SubscribeMessage('consume')
+  - Finds viewer's receive transport
+  - Checks if viewer can consume this producer
+  - Creates consumer on transport:
+    const consumer = await transport.consume({
+      producerId,
+      rtpCapabilities,
+      paused: true  // Start paused
+    })
+  - Stores consumer
+
+// BE sends back:
+socket.emit('consumed', {
+  id: 'consumer-xyz-789',      // Consumer ID
+  producerId: 'producer-abc-123',
+  kind: 'video',
+  rtpParameters: {...}          // How to decode it
+})
+
+// VIEWER: Creates local consumer
+const consumer = await recvTransport.consume({
+  id: data.id,
+  producerId: data.producerId,
+  kind: data.kind,
+  rtpParameters: data.rtpParameters,
+})
+
+// VIEWER: Adds track to stream
+const stream = new MediaStream([consumer.track])
+setRemoteStream(stream)  // Display in <video> element
+
+// VIEWER: Resume consumer to start receiving
+socket.emit('resumeConsumer', {
+  roomId,
+  consumerId: 'consumer-xyz-789'
+})
+
+// BE receives and unpauses:
+consumer.resume()
+// Media now flows: Host → Server → Viewer! 🎉
+```
+
+**Purpose:** Viewer receives and displays the host's video/audio stream.
+
+**Logs:**
+```
+[FE-MEDIASOUP] 📤 Requesting consume for producer-abc-123
+[MEDIASOUP] Consume request - Room: abc123, ProducerId: producer-abc-123
+[MEDIASOUP] Consumer created successfully: consumer-xyz-789
+[FE-MEDIASOUP] ✅ Consumer created, adding track to stream
+[FE-MEDIASOUP] 📤 Resuming consumer
+[MEDIASOUP] Resume consumer: consumer-xyz-789
+```
+
+---
+
+### PHASE 5: Cleanup (Leave/Disconnect)
+
+#### 7️⃣ Close Producer (Host Stops Sharing)
+
+**Location:** `useMediasoupWebRTC.ts:478-504` (stopScreenShare)
+
+**What happens:**
+
+```javascript
+// HOST: Stops screen share
+socket.emit('closeProducer', {
+  roomId: 'abc123',
+  producerId: 'producer-abc-123'
+})
+
+// BE receives (rooms.gateway.ts:756):
+@SubscribeMessage('closeProducer')
+  - Closes producer: producer.close()
+  - Removes from map
+
+// BE broadcasts to viewers:
+socket.to(roomId).emit('producerClosed', {
+  producerId: 'producer-abc-123'
+})
+
+// VIEWER: Receives event and cleans up consumer
+socket.on('producerClosed', (data) => {
+  const consumer = consumers.get(data.producerId)
+  consumer.close()
+  // Remove track from stream
+})
+```
+
+**Logs:**
+```
+[MEDIASOUP] Close producer: producer-abc-123
+[FE-MEDIASOUP] 📥 Producer closed: producer-abc-123
+```
+
+---
+
+#### 8️⃣ Cleanup User Media (Reconnection) ⭐
+
+**Location:** `mediasoup.service.ts:365-400`
+
+**What happens:**
+
+```javascript
+// When user reconnects (new socket ID):
+const closedProducerIds = this.mediasoupService.cleanupUserMedia(
+  roomId,
+  oldSocketId
+)
+
+// Function:
+cleanupUserMedia(roomId, oldSocketId):
+  1. Find all transports with oldSocketId prefix
+     Example: "oldSocket123-send", "oldSocket123-recv"
+
+  2. Close each transport:
+     transport.close()
+
+  3. Close ALL producers (can't track ownership):
+     producers.forEach(producer => producer.close())
+
+  4. Return closed producer IDs
+
+  5. Notify viewers:
+     closedProducerIds.forEach(id => {
+       socket.to(roomId).emit('producerClosed', { producerId: id })
+     })
+```
+
+**Purpose:** When host reconnects (page reload), clean up old connections before creating new ones.
+
+**Logs:**
+```
+[CLEANUP] 🧹 Starting media cleanup for room abc123, oldSocket oldSocket123
+[CLEANUP] 🚗 Closing transport for reconnected user: oldSocket123-send
+[CLEANUP] 🎬 Closing producer due to user reconnect: producer-abc-123
+[CLEANUP] ✅ Cleaned up 2 transports and 2 producers
+```
+
+---
+
+#### 9️⃣ Close Room (Host Leaves) ⭐⭐
+
+**Location:** `mediasoup.service.ts:402-434`
+
+**What happens:**
+
+```javascript
+// When host leaves/disconnects permanently:
+this.mediasoupService.closeRoom(roomId)
+
+// Function:
+closeRoom(roomId):
+  1. Get room router and count resources
+
+  2. Close all consumers (viewer connections):
+     consumers.forEach(consumer => consumer.close())
+     consumers.clear()
+
+  3. Close all producers (host streams):
+     producers.forEach(producer => producer.close())
+     producers.clear()
+
+  4. Close all transports (all pipes):
+     transports.forEach(transport => transport.close())
+     transports.clear()
+
+  5. Close router (mediasoup room):
+     router.close()
+
+  6. Remove room from map:
+     this.routers.delete(roomId)
+```
+
+> [!CAUTION]
+> **THIS IS WHERE WORKERS ARE FREED!** When the room closes, all mediasoup resources are released, and the worker can handle new rooms.
+
+**Logs:**
+```
+[DISCONNECT] 🧹 Cleaning up mediasoup resources for room abc123
+[CLOSE-ROOM] 🗑️ Starting room cleanup for abc123
+[CLOSE-ROOM] 🎧 Closed 3 consumers
+[CLOSE-ROOM] 🎬 Closed 2 producers
+[CLOSE-ROOM] 🚗 Closed 5 transports
+[CLOSE-ROOM] ✅ Room abc123 fully closed
+```
+
+---
+
+## 📊 Summary Table
+
+| Function                 | Who Calls   | Direction                 | What It Does                           |
+|--------------------------|-------------|---------------------------|----------------------------------------|
+| getRouterRtpCapabilities | Both        | Client → Server → Client  | Get supported codecs (VP8, Opus, etc.) |
+| createTransport          | Both        | Client → Server → Client  | Create send/recv pipe                  |
+| connectTransport         | Both        | Client → Server → Client  | Establish DTLS encryption              |
+| produce                  | Host only   | Client → Server           | Send video/audio tracks to server      |
+| getProducers             | Viewer only | Client → Server → Client  | Get list of available streams          |
+| consume                  | Viewer only | Client → Server → Client  | Receive specific stream                |
+| resumeConsumer           | Viewer only | Client → Server           | Unpause stream (start flowing)         |
+| closeProducer            | Host only   | Client → Server → Viewers | Stop producing stream                  |
+| cleanupUserMedia         | N/A         | Server-side               | Clean up on reconnect                  |
+| closeRoom                | N/A         | Server-side               | Free all workers on room close         |
+
+---
+
+## 🔄 Complete Flow Diagram
 
 ```mermaid
 sequenceDiagram
-    participant H as Host (Client)
-    participant S as Server (Gateway + SFU)
-    participant V as Viewer (Client)
-    
-    Note over H,V: Phase 1: Initialization
-    H->>S: createRoom
-    S-->>H: roomId
+    participant H as Host
+    participant S as Server (SFU)
+    participant V as Viewer
+
+    Note over H,V: PHASE 1: Initial Setup
     H->>S: getRouterRtpCapabilities
     S-->>H: rtpCapabilities
     H->>H: device.load(capabilities)
     
-    Note over H,V: Phase 2: Host Publishing
-    H->>S: createTransport (isProducer: true)
-    S-->>H: transport params
+    Note over H,V: PHASE 2: Transport Creation (Host)
+    H->>S: createTransport (send)
+    S-->>H: transportParams
     H->>H: createSendTransport()
-    H->>S: connectTransport (DTLS params)
-    H->>H: getUserMedia() / getDisplayMedia()
-    H->>S: produce (RTP params)
-    S->>S: Create Producer
-    S-->>V: newProducer (broadcast)
+    H->>S: connectTransport (DTLS)
+    S-->>H: transportConnected
     
-    Note over H,V: Phase 3: Viewer Consuming
-    V->>S: createTransport (isProducer: false)
-    S-->>V: transport params
+    Note over H,V: PHASE 3: Media Production (Host)
+    H->>H: getDisplayMedia()
+    H->>S: produce (video track)
+    S->>S: Create Producer
+    S-->>H: producerId
+    S->>V: newProducer (broadcast)
+    
+    Note over H,V: PHASE 2: Transport Creation (Viewer)
+    V->>S: createTransport (recv)
+    S-->>V: transportParams
     V->>V: createRecvTransport()
-    V->>S: connectTransport
+    V->>S: connectTransport (DTLS)
+    S-->>V: transportConnected
+    
+    Note over H,V: PHASE 4: Media Consumption (Viewer)
+    V->>S: getProducers
+    S-->>V: producers list
     V->>S: consume (producerId)
     S->>S: Create Consumer
-    S-->>V: consumer params
+    S-->>V: consumerParams
     V->>V: recvTransport.consume()
     V->>S: resumeConsumer
-    S->>V: Media Stream
-    V->>V: Display Stream
+    S->>V: Media Stream ✅
+    
+    Note over H,V: PHASE 5: Cleanup
+    H->>S: closeProducer
+    S->>V: producerClosed (broadcast)
+    V->>V: Close consumer
 ```
 
 ---
 
-## 5️⃣ Mô Hình SFU
+## 🎯 Workflow Overview
 
-```mermaid
-graph TB
-    subgraph "Host Side"
-        H[Host Client]
-        HST[Send Transport]
-    end
-    
-    subgraph "Server - SFU Router"
-        R[Mediasoup Router]
-        P[Producer]
-        C1[Consumer 1]
-        C2[Consumer 2]
-        CN[Consumer N]
-    end
-    
-    subgraph "Viewer Side"
-        V1[Viewer 1]
-        V2[Viewer 2]
-        VN[Viewer N]
-        RT1[Recv Transport 1]
-        RT2[Recv Transport 2]
-        RTN[Recv Transport N]
-    end
-    
-    H -->|1 Stream| HST
-    HST -->|WebRTC| P
-    P --> R
-    R --> C1
-    R --> C2
-    R --> CN
-    C1 -->|WebRTC| RT1
-    C2 -->|WebRTC| RT2
-    CN -->|WebRTC| RTN
-    RT1 --> V1
-    RT2 --> V2
-    RTN --> VN
-    
-    style H fill:#4CAF50
-    style R fill:#2196F3
-    style V1 fill:#FF9800
-    style V2 fill:#FF9800
-    style VN fill:#FF9800
-```
+### ┌─────────────────────────────────────────────────────────────┐
+### │                     HOST WORKFLOW                            │
+### └─────────────────────────────────────────────────────────────┘
 
-### 🎯 Ưu Điểm SFU
+1. Get RTP Capabilities → Load device
+2. Create Send Transport → Connect it
+3. Get screen stream → Produce video → Produce audio
+4. Server broadcasts "newProducer" to all viewers
 
-> [!TIP]
-> **Tối ưu hóa băng thông cho Host**: Host chỉ gửi **1 luồng** duy nhất lên server, thay vì gửi N luồng cho N viewers.
+### ┌─────────────────────────────────────────────────────────────┐
+### │                    VIEWER WORKFLOW                           │
+### └─────────────────────────────────────────────────────────────┘
 
-| Thành Phần | Vai Trò |
-|-----------|---------|
-| **Signaling (Socket.IO)** | Trao đổi thông số kỹ thuật (capabilities, DTLS params, RTP params) giữa Client và Server |
-| **Host Producer** | Gửi 1 luồng media lên SFU Router qua Send Transport |
-| **SFU Router** | Chuyển tiếp gói tin (không decode/mix) - tạo Consumer riêng cho mỗi Viewer |
-| **Viewer Consumer** | Nhận luồng media riêng từ SFU qua Receive Transport |
+1. Get RTP Capabilities → Load device
+2. Create Receive Transport → Connect it
+3. Get Producers list → For each producer:
+   - Consume producer → Add track to stream → Resume consumer
+4. Display stream in `<video>` element
+
+### ┌─────────────────────────────────────────────────────────────┐
+### │              RECONNECTION/CLEANUP WORKFLOW                   │
+### └─────────────────────────────────────────────────────────────┘
+
+**User Reconnects:**
+- → `cleanupUserMedia(oldSocketId)`
+- → Close old transports
+- → Close old producers
+- → Notify viewers
+- → User creates new transports/producers
+
+**Host Leaves:**
+- → `closeRoom(roomId)`
+- → Close all consumers, producers, transports
+- → Close router
+- → **Workers are freed and ready for new rooms!**
 
 ---
 
-## 🔒 Resource Management
+## 🔑 Key Takeaways
 
-> [!WARNING]
-> Luôn đảm bảo cleanup resources khi:
-> - Host/Viewer ngắt kết nối
-> - Phòng bị đóng
-> - Lỗi xảy ra trong quá trình streaming
+> [!IMPORTANT]
+> 1. **SFU Architecture**: Server forwards media without transcoding - acts as a smart router
+> 2. **Transports**: Bidirectional WebRTC pipes (Send for host, Receive for viewers)
+> 3. **Producer/Consumer Model**: Host produces media, viewers consume it
+> 4. **Resource Cleanup**: `closeRoom()` is where workers are freed when viewers leave
 
-### Cleanup Methods
-- `closeProducer()` - Đóng luồng xuất bản
-- `closeConsumer()` - Đóng luồng tiêu thụ  
-- `closeRoom()` - Đóng toàn bộ router
+This is the complete mediasoup workflow! The key understanding: `closeRoom()` is where workers are cleaned up when viewers leave (by closing the room when the host leaves).
