@@ -35,7 +35,7 @@ export class MediasoupService implements OnModuleInit {
       .listenIps as MediasoupTypes.TransportListenIp[];
     listenIps[0].announcedIp =
       this.configService.get<string>('MEDIASOUP_ANNOUNCED_IP') || undefined; // Default to undefined for local testing
-
+    console.log('listenIps', listenIps);
     this.logger.log(
       `Mediasoup announced IP set to: ${listenIps[0].announcedIp || 'undefined (local testing)'}`,
     );
