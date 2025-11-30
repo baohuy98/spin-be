@@ -41,3 +41,6 @@ lerna-debug.log*
 
 # Local JSON storage
 /data
+
+
+.env
