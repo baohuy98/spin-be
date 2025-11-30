@@ -1,4 +1,5 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import * as mediasoup from 'mediasoup';
 import { types as MediasoupTypes } from 'mediasoup';
 import * as os from 'os';
@@ -28,6 +29,18 @@ export class MediasoupService implements OnModuleInit {
   private nextWorkerIndex = 0;
   private routers: Map<string, RoomRouter> = new Map();
 
+  constructor(private readonly configService: ConfigService) {
+    // Set the announced IP dynamically from environment variables
+    const listenIps = this.webRtcTransportConfig
+      .listenIps as MediasoupTypes.TransportListenIp[];
+    listenIps[0].announcedIp =
+      this.configService.get<string>('MEDIASOUP_ANNOUNCED_IP') || undefined; // Default to undefined for local testing
+
+    this.logger.log(
+      `Mediasoup announced IP set to: ${listenIps[0].announcedIp || 'undefined (local testing)'}`,
+    );
+  }
+
   // Mediasoup configuration
   private readonly workerConfig: MediasoupTypes.WorkerSettings = {
     logLevel: 'warn',
@@ -43,11 +56,11 @@ export class MediasoupService implements OnModuleInit {
     rtcMaxPort: 10100,
   };
 
-  private readonly webRtcTransportConfig = {
+  private readonly webRtcTransportConfig: MediasoupTypes.WebRtcTransportOptions = {
     listenIps: [
       {
         ip: '0.0.0.0',
-        announcedIp: '172.20.10.3', // Use public IP or set your server IP here for production or undefined for local testing
+
       },
     ],
     enableUdp: true,
