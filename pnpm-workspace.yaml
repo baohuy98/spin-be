@@ -1,0 +1,6 @@
+onlyBuiltDependencies:
+  - mediasoup
+  - '@firebase/util'
+  - '@nestjs/core'
+  - protobufjs
+  - unrs-resolver
