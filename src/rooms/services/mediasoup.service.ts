@@ -105,6 +105,7 @@ export class MediasoupService implements OnModuleInit {
 
   async onModuleInit() {
     await this.createWorkers();
+    this.startMonitoring();
   }
 
   // count of CPU cores to create equivalent mediasoup workers
@@ -121,12 +122,42 @@ export class MediasoupService implements OnModuleInit {
         );
         setTimeout(() => process.exit(1), 2000);
       });
+      setInterval(async () => {
+        const usage = await worker.getResourceUsage();
+        if (usage.ru_maxrss > 500000) {  // > 500MB
+          this.logger.warn(
+            `Worker ${worker.pid} high memory usage: ${usage.ru_maxrss / 1024}MB`
+          );
+        }
+      }, 60000); // Check every minute
 
       this.workers.push(worker);
       this.logger.log(`Worker created [pid:${worker.pid}]`);
     }
   }
+  private startMonitoring() {
+    setInterval(() => {
+      const stats = {
+        totalRooms: this.routers.size,
+        totalTransports: 0,
+        totalProducers: 0,
+        totalConsumers: 0,
+      };
 
+      this.routers.forEach((roomRouter) => {
+        stats.totalTransports += roomRouter.transports.size;
+        stats.totalProducers += roomRouter.producers.size;
+        stats.totalConsumers += roomRouter.consumers.size;
+      });
+
+      this.logger.log(`📊 Stats: ${JSON.stringify(stats)}`);
+
+      // ⚠️ Warning nếu gần giới hạn
+      if (stats.totalConsumers > 30) {
+        this.logger.warn('⚠️ Nearing capacity: 30+ consumers');
+      }
+    }, 30000); // Log every 30 seconds
+  }
   private getNextWorker(): Worker {
     const worker = this.workers[this.nextWorkerIndex];
     this.nextWorkerIndex = (this.nextWorkerIndex + 1) % this.workers.length;
