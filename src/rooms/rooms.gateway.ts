@@ -300,7 +300,7 @@ export class RoomsGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (!isAlreadyInRoom) {
       const membersWithDetails = this.roomsService.getRoomMembersWithDetails(data.roomId);
       const duplicateName = membersWithDetails.find(
-        member => member.name === data.name && member.name !== data.memberId
+        member => member.name === data.name && member.genID !== data.memberId
       );
 
       if (duplicateName) {
