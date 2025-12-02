@@ -32,9 +32,23 @@ export class MediasoupService implements OnModuleInit {
   // Auto-scaling configuration (set during createWorkers)
   private minWorkers = 2;
   private maxWorkers = 0;
-  private readonly routersPerWorkerThreshold = 5; // Scale up when average > 5 routers per worker
-  private readonly scaleDownThreshold = 2.5; // Scale down when average < 2.5 routers per worker
   private isScaling = false; // Prevent concurrent scaling operations
+
+  // Dynamic resource usage thresholds
+  private readonly RESOURCE_USAGE_THRESHOLD = 0.75; // Scale up when resource usage > 75%
+  private readonly SCALE_DOWN_THRESHOLD = 0.3; // Scale down when usage < 30%
+
+  // Track worker resource metrics (updated periodically)
+  private workerResourceUsage: Map<
+    Worker,
+    {
+      cpuUsage: number; // 0-1 (percentage)
+      routerCount: number;
+      producerCount: number;
+      consumerCount: number;
+      lastUpdate: number;
+    }
+  > = new Map();
 
   constructor(private readonly configService: ConfigService) {
     // Set the announced IP dynamically from environment variables
@@ -160,7 +174,6 @@ export class MediasoupService implements OnModuleInit {
   private async createSingleWorker(index: number): Promise<Worker> {
     const worker = await mediasoup.createWorker(this.workerConfig);
 
-    // Handle worker death with recovery instead of crashing the app
     worker.on('died', () => {
       this.logger.error(
         `Worker ${index} died unexpectedly [pid:${worker.pid}]. Attempting recovery...`,
@@ -186,9 +199,6 @@ export class MediasoupService implements OnModuleInit {
     return worker;
   }
 
-  /**
-   * Attempts to create a replacement worker when one dies
-   */
   private async recoverWorker(index: number): Promise<void> {
     try {
       this.logger.log(`Attempting to recover worker ${index}...`);
@@ -231,6 +241,95 @@ export class MediasoupService implements OnModuleInit {
     }, 30000); // Log every 30 seconds
   }
 
+  /**
+   * Update worker resource usage metrics from mediasoup worker stats
+   */
+  private async updateWorkerResourceMetrics() {
+    const updatePromises = this.workers.map(async (worker) => {
+      try {
+        // Get real-time resource usage from mediasoup worker
+        const resourceUsage = await worker.getResourceUsage();
+
+        // Count routers, producers, consumers for this worker
+        let routerCount = 0;
+        let producerCount = 0;
+        let consumerCount = 0;
+
+        this.routers.forEach((roomRouter) => {
+          // Check if this router belongs to this worker
+          if (roomRouter.router.appData.workerId === worker.pid) {
+            routerCount++;
+            producerCount += roomRouter.producers.size;
+            consumerCount += roomRouter.consumers.size;
+          }
+        });
+
+        // Calculate CPU usage percentage (ru_utime + ru_stime in microseconds)
+        const cpuUsage =
+          (resourceUsage.ru_utime + resourceUsage.ru_stime) / 1000000; // Convert to seconds
+
+        this.workerResourceUsage.set(worker, {
+          cpuUsage: Math.min(cpuUsage, 1.0), // Normalize to 0-1
+          routerCount,
+          producerCount,
+          consumerCount,
+          lastUpdate: Date.now(),
+        });
+      } catch (error) {
+        this.logger.error(
+          `Failed to get resource usage for worker ${worker.pid}:`,
+          error,
+        );
+      }
+    });
+
+    await Promise.allSettled(updatePromises);
+  }
+
+  /**
+   * Calculate resource usage across all workers
+   */
+  private calculateResourceUsage(): {
+    maxCpuUsage: number;
+    avgCpuUsage: number;
+    maxProducersPerWorker: number;
+    maxConsumersPerWorker: number;
+    totalProducers: number;
+    totalConsumers: number;
+  } {
+    let totalCpu = 0;
+    let maxCpu = 0;
+    let totalProducers = 0;
+    let totalConsumers = 0;
+    let maxProducers = 0;
+    let maxConsumers = 0;
+
+    this.workerResourceUsage.forEach((usage) => {
+      totalCpu += usage.cpuUsage;
+      maxCpu = Math.max(maxCpu, usage.cpuUsage);
+      totalProducers += usage.producerCount;
+      totalConsumers += usage.consumerCount;
+      maxProducers = Math.max(maxProducers, usage.producerCount);
+      maxConsumers = Math.max(maxConsumers, usage.consumerCount);
+    });
+
+    return {
+      maxCpuUsage: maxCpu,
+      avgCpuUsage:
+        this.workers.length > 0 ? totalCpu / this.workers.length : 0,
+      maxProducersPerWorker: maxProducers,
+      maxConsumersPerWorker: maxConsumers,
+      totalProducers,
+      totalConsumers,
+    };
+  }
+
+  /**
+   * Event-driven auto-scaling based on REAL worker resource usage
+   * - Uses mediasoup's getResourceUsage() for actual CPU metrics
+   * - Monitors real producer/consumer load per worker
+   * - Scales based on measured capacity, not arbitrary limits
+   */
   private async checkAndScale() {
     // Prevent concurrent scaling
     if (this.isScaling) {
@@ -249,40 +348,58 @@ export class MediasoupService implements OnModuleInit {
         return;
       }
 
-      const avgRoutersPerWorker = routerCount / currentWorkerCount;
+      // Update real-time resource metrics from workers
+      await this.updateWorkerResourceMetrics();
+
+      // Calculate resource usage
+      const usage = this.calculateResourceUsage();
 
       this.logger.debug(
-        `[AUTO-SCALE] Workers: ${currentWorkerCount}, Routers: ${routerCount}, Avg: ${avgRoutersPerWorker.toFixed(2)}`,
+        `[AUTO-SCALE] Workers: ${currentWorkerCount}, Routers: ${routerCount}, ` +
+        `CPU: max=${(usage.maxCpuUsage * 100).toFixed(1)}%, avg=${(usage.avgCpuUsage * 100).toFixed(1)}%, ` +
+        `Producers: total=${usage.totalProducers}, max/worker=${usage.maxProducersPerWorker}, ` +
+        `Consumers: total=${usage.totalConsumers}, max/worker=${usage.maxConsumersPerWorker}`,
       );
 
-      // SCALE UP: Add worker if load is high and below max
-      if (
-        avgRoutersPerWorker > this.routersPerWorkerThreshold &&
-        currentWorkerCount < this.maxWorkers
-      ) {
-        this.logger.log(
-          `[AUTO-SCALE] ⬆️  Scaling UP: Adding worker (current: ${currentWorkerCount}, avg routers/worker: ${avgRoutersPerWorker.toFixed(2)})`,
-        );
+      // SCALE UP: Check if any worker is approaching capacity
+      const shouldScaleUp = usage.maxCpuUsage > this.RESOURCE_USAGE_THRESHOLD;
+
+      if (shouldScaleUp && currentWorkerCount < this.maxWorkers) {
+        const reasons: string[] = [];
+        if (usage.maxCpuUsage > this.RESOURCE_USAGE_THRESHOLD)
+          reasons.push(
+            `CPU: ${(usage.maxCpuUsage * 100).toFixed(1)}% > ${this.RESOURCE_USAGE_THRESHOLD * 100}%`,
+          );
+
+        this.logger.log(`[AUTO-SCALE] ⬆️  Scaling UP (${reasons.join(', ')})`);
         const newWorker = await this.createSingleWorker(currentWorkerCount);
         this.workers.push(newWorker);
+        this.workerResourceUsage.set(newWorker, {
+          cpuUsage: 0,
+          routerCount: 0,
+          producerCount: 0,
+          consumerCount: 0,
+          lastUpdate: Date.now(),
+        });
         this.logger.log(
-          `[AUTO-SCALE] ✅ Worker added successfully [pid:${newWorker.pid}]. Total workers: ${this.workers.length}`,
+          `[AUTO-SCALE] ✅ Worker added [pid:${newWorker.pid}]. Total: ${this.workers.length}`,
         );
       }
 
-      // SCALE DOWN: Remove worker if underutilized and above minimum
+      // SCALE DOWN: Remove worker if all workers are significantly underutilized
       else if (
-        avgRoutersPerWorker < this.scaleDownThreshold &&
-        currentWorkerCount > this.minWorkers
+        currentWorkerCount > this.minWorkers &&
+        usage.avgCpuUsage < this.SCALE_DOWN_THRESHOLD
       ) {
         const workerToRemove = this.workers.pop();
         if (workerToRemove) {
           this.logger.log(
-            `[AUTO-SCALE] ⬇️  Scaling DOWN: Removing worker [pid:${workerToRemove.pid}] (current: ${currentWorkerCount}, avg routers/worker: ${avgRoutersPerWorker.toFixed(2)})`,
+            `[AUTO-SCALE] ⬇️  Scaling DOWN (low CPU usage: ${(usage.avgCpuUsage * 100).toFixed(1)}% < ${this.SCALE_DOWN_THRESHOLD * 100}%)`,
           );
+          this.workerResourceUsage.delete(workerToRemove);
           workerToRemove.close();
           this.logger.log(
-            `[AUTO-SCALE] ✅ Worker removed. Total workers: ${this.workers.length}`,
+            `[AUTO-SCALE] ✅ Worker removed. Total: ${this.workers.length}`,
           );
         }
       }
@@ -306,7 +423,10 @@ export class MediasoupService implements OnModuleInit {
     }
 
     const worker = this.getNextWorker();
-    const router = await worker.createRouter({ mediaCodecs: this.mediaCodecs });
+    const router = await worker.createRouter({
+      mediaCodecs: this.mediaCodecs,
+      appData: { workerId: worker.pid }, // Track which worker owns this router
+    });
 
     this.routers.set(roomId, {
       router,
