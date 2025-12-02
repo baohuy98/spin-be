@@ -8,7 +8,7 @@ import { StorageService } from '../interfaces/storage.interface';
 export class FirebaseService implements StorageService, OnModuleInit {
   private db: admin.firestore.Firestore;
 
-  constructor(private configService: ConfigService) { }
+  constructor(private configService: ConfigService) {}
 
   onModuleInit() {
     if (!admin.apps.length) {

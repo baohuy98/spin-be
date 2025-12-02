@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-misused-promises */
 /* eslint-disable @typescript-eslint/require-await */
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';

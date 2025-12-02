@@ -29,11 +29,12 @@ export class ChatGateway {
     @Inject(STORAGE_SERVICE)
     private readonly storageService: StorageService,
     private readonly messageValidationService: MessageValidationService,
-  ) { }
+  ) {}
 
   @SubscribeMessage('send-message')
   async handleSendMessage(@MessageBody() data: SendMessageDto) {
-    const { containsProfanity, cleanedMessage } = this.messageValidationService.validateMessage(data.message);
+    const { containsProfanity, cleanedMessage } =
+      this.messageValidationService.validateMessage(data.message);
 
     const message = new Message({
       id: uuidv4(),

@@ -10,4 +10,4 @@ import { MediasoupService } from './services/mediasoup.service';
   providers: [RoomsGateway, RoomsService, RoomsRepository, MediasoupService],
   exports: [RoomsService],
 })
-export class RoomsModule { }
+export class RoomsModule {}

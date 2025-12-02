@@ -92,7 +92,12 @@ export class RoomsRepository {
   }
 
   // Logged-in users operations
-  addLoggedInUser(genID: string, name: string, roomId: string | null, socketId: string): void {
+  addLoggedInUser(
+    genID: string,
+    name: string,
+    roomId: string | null,
+    socketId: string,
+  ): void {
     this.loggedInUsers.set(genID, { genID, name, roomId, socketId });
   }
 
@@ -133,7 +138,7 @@ export class RoomsRepository {
 
   getLoggedInUsersByRoom(roomId: string): LoggedInUser[] {
     return Array.from(this.loggedInUsers.values()).filter(
-      user => user.roomId === roomId
+      (user) => user.roomId === roomId,
     );
   }
 }

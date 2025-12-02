@@ -24,7 +24,7 @@ export class RoomsService {
     private readonly roomsRepository: RoomsRepository,
     @Inject(STORAGE_SERVICE)
     private readonly storageService: StorageService,
-  ) { }
+  ) {}
 
   /**
    * Generate a deterministic room ID based on host ID
@@ -59,7 +59,9 @@ export class RoomsService {
     // Check if room already exists for this host (stable room ID)
     const existingRoom = this.roomsRepository.findRoomById(roomId);
     if (existingRoom) {
-      console.log(`[RoomsService] Reusing existing room ${roomId} for host ${hostId}`);
+      console.log(
+        `[RoomsService] Reusing existing room ${roomId} for host ${hostId}`,
+      );
 
       // Clean up stale members (viewers who are no longer connected)
       const staleMembers: string[] = [];
@@ -75,7 +77,9 @@ export class RoomsService {
 
       // Remove stale members
       for (const staleMemberId of staleMembers) {
-        console.log(`[RoomsService] Removing stale member ${staleMemberId} from room ${roomId}`);
+        console.log(
+          `[RoomsService] Removing stale member ${staleMemberId} from room ${roomId}`,
+        );
         this.roomsRepository.removeMemberFromRoom(roomId, staleMemberId);
         this.roomsRepository.removeLoggedInUser(staleMemberId);
         this.roomsRepository.deleteUserRoom(staleMemberId);
@@ -104,7 +108,11 @@ export class RoomsService {
     return this.roomsRepository.findRoomById(roomId);
   }
 
-  validateRoom(roomId: string): { exists: boolean; roomId: string; memberCount?: number } {
+  validateRoom(roomId: string): {
+    exists: boolean;
+    roomId: string;
+    memberCount?: number;
+  } {
     const room = this.roomsRepository.findRoomById(roomId);
 
     if (room) {
@@ -218,7 +226,12 @@ export class RoomsService {
   }
 
   // Logged-in users management
-  addLoggedInUser(genID: string, name: string, roomId: string | null, socketId: string): void {
+  addLoggedInUser(
+    genID: string,
+    name: string,
+    roomId: string | null,
+    socketId: string,
+  ): void {
     this.roomsRepository.addLoggedInUser(genID, name, roomId, socketId);
   }
 
@@ -251,18 +264,20 @@ export class RoomsService {
   }
 
   // Get room members with full details (name + genID)
-  getRoomMembersWithDetails(roomId: string): Array<{ genID: string; name: string; isHost: boolean }> {
+  getRoomMembersWithDetails(
+    roomId: string,
+  ): Array<{ genID: string; name: string; isHost: boolean }> {
     const room = this.roomsRepository.findRoomById(roomId);
     if (!room) {
       return [];
     }
 
-    return room.members.map(memberId => {
+    return room.members.map((memberId) => {
       const loggedInUser = this.roomsRepository.getLoggedInUser(memberId);
       return {
         genID: memberId,
         name: loggedInUser?.name || `User ${memberId}`,
-        isHost: memberId === room.hostId
+        isHost: memberId === room.hostId,
       };
     });
   }

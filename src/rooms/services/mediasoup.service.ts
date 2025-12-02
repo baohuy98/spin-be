@@ -29,13 +29,19 @@ export class MediasoupService implements OnModuleInit {
   private nextWorkerIndex = 0;
   private routers: Map<string, RoomRouter> = new Map();
 
+  // Auto-scaling configuration (set during createWorkers)
+  private minWorkers = 2;
+  private maxWorkers = 0;
+  private readonly routersPerWorkerThreshold = 5; // Scale up when average > 5 routers per worker
+  private readonly scaleDownThreshold = 2.5; // Scale down when average < 2.5 routers per worker
+  private isScaling = false; // Prevent concurrent scaling operations
+
   constructor(private readonly configService: ConfigService) {
     // Set the announced IP dynamically from environment variables
     const listenIps = this.webRtcTransportConfig
       .listenIps as MediasoupTypes.TransportListenIp[];
     listenIps[0].announcedIp =
       this.configService.get<string>('MEDIASOUP_ANNOUNCED_IP') || undefined; // Default to undefined for local testing
-    console.log('listenIps', listenIps);
     this.logger.log(
       `Mediasoup announced IP set to: ${listenIps[0].announcedIp || 'undefined (local testing)'}`,
     );
@@ -56,17 +62,17 @@ export class MediasoupService implements OnModuleInit {
     rtcMaxPort: 10100,
   };
 
-  private readonly webRtcTransportConfig: MediasoupTypes.WebRtcTransportOptions = {
-    listenIps: [
-      {
-        ip: '0.0.0.0',
-
-      },
-    ],
-    enableUdp: true,
-    enableTcp: true,
-    preferUdp: true,
-  };
+  private readonly webRtcTransportConfig: MediasoupTypes.WebRtcTransportOptions =
+    {
+      listenIps: [
+        {
+          ip: '0.0.0.0',
+        },
+      ],
+      enableUdp: true,
+      enableTcp: true,
+      preferUdp: true,
+    };
 
   private readonly mediaCodecs = [
     {
@@ -121,40 +127,93 @@ export class MediasoupService implements OnModuleInit {
     this.startMonitoring();
   }
 
-  // count of CPU cores to create equivalent mediasoup workers
   private async createWorkers() {
-    const numWorkers = os.cpus().length;
-    this.logger.log(`Creating ${numWorkers} mediasoup workers...`);
+    const cpuCount = os.cpus().length;
+    this.maxWorkers = cpuCount;
+    this.minWorkers = Math.min(2, this.maxWorkers);
 
-    for (let i = 0; i < numWorkers; i++) {
-      const worker = await mediasoup.createWorker(this.workerConfig);
+    const workerPromises = Array.from({ length: this.minWorkers }, (_, index) =>
+      this.createSingleWorker(index),
+    );
+    try {
+      const workers = await Promise.allSettled(workerPromises);
 
-      worker.on('died', () => {
-        this.logger.error(
-          `Worker ${worker.pid} died, exiting in 2 seconds... [pid:${worker.pid}]`,
-        );
-        setTimeout(() => process.exit(1), 2000);
-      });
-      setInterval(async () => {
-        const usage = await worker.getResourceUsage();
-        if (usage.ru_maxrss > 500000) {  // > 500MB
-          this.logger.warn(
-            `Worker ${worker.pid} high memory usage: ${usage.ru_maxrss / 1024}MB`
+      workers.forEach((result, index) => {
+        if (result.status === 'fulfilled' && result.value) {
+          this.workers.push(result.value);
+        } else {
+          this.logger.error(
+            `Failed to create worker ${index}: ${result.status === 'rejected' ? result.reason : 'Unknown error'}`,
           );
         }
-      }, 60000); // Check every minute
+      });
 
-      this.workers.push(worker);
-      this.logger.log(`Worker created [pid:${worker.pid}]`);
+      if (this.workers.length === 0) {
+        throw new Error('Failed to create any mediasoup workers');
+      }
+    } catch (error) {
+      this.logger.error('Critical error during worker creation:', error);
+      throw error;
+    }
+  }
+
+  private async createSingleWorker(index: number): Promise<Worker> {
+    const worker = await mediasoup.createWorker(this.workerConfig);
+
+    // Handle worker death with recovery instead of crashing the app
+    worker.on('died', () => {
+      this.logger.error(
+        `Worker ${index} died unexpectedly [pid:${worker.pid}]. Attempting recovery...`,
+      );
+
+      const workerIndex = this.workers.indexOf(worker);
+      if (workerIndex !== -1) {
+        this.workers.splice(workerIndex, 1);
+      }
+
+      this.recoverWorker(index).catch((error) => {
+        this.logger.error(`Failed to recover worker ${index}:`, error);
+
+        if (this.workers.length === 0) {
+          this.logger.error(
+            'No workers available. Shutting down in 5 seconds...',
+          );
+          setTimeout(() => process.exit(1), 5000);
+        }
+      });
+    });
+
+    return worker;
+  }
+
+  /**
+   * Attempts to create a replacement worker when one dies
+   */
+  private async recoverWorker(index: number): Promise<void> {
+    try {
+      this.logger.log(`Attempting to recover worker ${index}...`);
+      const newWorker = await this.createSingleWorker(index);
+      this.workers.push(newWorker);
+      this.logger.log(
+        `Worker ${index} recovered successfully [pid:${newWorker.pid}]`,
+      );
+    } catch (error) {
+      this.logger.error(`Worker ${index} recovery failed:`, error);
+      throw error;
     }
   }
   private startMonitoring() {
     setInterval(() => {
       const stats = {
+        totalWorkers: this.workers.length,
         totalRooms: this.routers.size,
         totalTransports: 0,
         totalProducers: 0,
         totalConsumers: 0,
+        avgRoutersPerWorker:
+          this.workers.length > 0
+            ? (this.routers.size / this.workers.length).toFixed(2)
+            : 0,
       };
 
       this.routers.forEach((roomRouter) => {
@@ -165,11 +224,73 @@ export class MediasoupService implements OnModuleInit {
 
       this.logger.log(`📊 Stats: ${JSON.stringify(stats)}`);
 
-      // ⚠️ Warning nếu gần giới hạn
+      // ⚠️ Warning if nearing capacity
       if (stats.totalConsumers > 30) {
         this.logger.warn('⚠️ Nearing capacity: 30+ consumers');
       }
     }, 30000); // Log every 30 seconds
+  }
+
+  private async checkAndScale() {
+    // Prevent concurrent scaling
+    if (this.isScaling) {
+      this.logger.debug('[AUTO-SCALE] Scaling already in progress, skipping');
+      return;
+    }
+
+    this.isScaling = true;
+
+    try {
+      const currentWorkerCount = this.workers.length;
+      const routerCount = this.routers.size;
+
+      // Skip if no routers exist
+      if (routerCount === 0) {
+        return;
+      }
+
+      const avgRoutersPerWorker = routerCount / currentWorkerCount;
+
+      this.logger.debug(
+        `[AUTO-SCALE] Workers: ${currentWorkerCount}, Routers: ${routerCount}, Avg: ${avgRoutersPerWorker.toFixed(2)}`,
+      );
+
+      // SCALE UP: Add worker if load is high and below max
+      if (
+        avgRoutersPerWorker > this.routersPerWorkerThreshold &&
+        currentWorkerCount < this.maxWorkers
+      ) {
+        this.logger.log(
+          `[AUTO-SCALE] ⬆️  Scaling UP: Adding worker (current: ${currentWorkerCount}, avg routers/worker: ${avgRoutersPerWorker.toFixed(2)})`,
+        );
+        const newWorker = await this.createSingleWorker(currentWorkerCount);
+        this.workers.push(newWorker);
+        this.logger.log(
+          `[AUTO-SCALE] ✅ Worker added successfully [pid:${newWorker.pid}]. Total workers: ${this.workers.length}`,
+        );
+      }
+
+      // SCALE DOWN: Remove worker if underutilized and above minimum
+      else if (
+        avgRoutersPerWorker < this.scaleDownThreshold &&
+        currentWorkerCount > this.minWorkers
+      ) {
+        const workerToRemove = this.workers.pop();
+        if (workerToRemove) {
+          this.logger.log(
+            `[AUTO-SCALE] ⬇️  Scaling DOWN: Removing worker [pid:${workerToRemove.pid}] (current: ${currentWorkerCount}, avg routers/worker: ${avgRoutersPerWorker.toFixed(2)})`,
+          );
+          workerToRemove.close();
+          this.logger.log(
+            `[AUTO-SCALE] ✅ Worker removed. Total workers: ${this.workers.length}`,
+          );
+        }
+      }
+    } catch (error) {
+      this.logger.error('[AUTO-SCALE] Scaling operation failed:', error);
+    } finally {
+      this.isScaling = false;
+    }
   }
   private getNextWorker(): Worker {
     const worker = this.workers[this.nextWorkerIndex];
@@ -196,6 +317,10 @@ export class MediasoupService implements OnModuleInit {
 
     this.logger.log(`Router created for room: ${roomId} `);
     console.log('routers', this.routers);
+
+    // Trigger immediate auto-scaling check
+    void this.checkAndScale();
+
     return router;
   }
 
@@ -309,14 +434,18 @@ export class MediasoupService implements OnModuleInit {
       return null;
     }
 
-    this.logger.log(`Available transports: ${Array.from(roomRouter.transports.keys()).join(', ')}`);
+    this.logger.log(
+      `Available transports: ${Array.from(roomRouter.transports.keys()).join(', ')}`,
+    );
     const transport = roomRouter.transports.get(transportId);
     if (!transport) {
       this.logger.warn(`Transport not found: ${transportId}`);
       return null;
     }
 
-    this.logger.log(`Available producers: ${Array.from(roomRouter.producers.keys()).join(', ')}`);
+    this.logger.log(
+      `Available producers: ${Array.from(roomRouter.producers.keys()).join(', ')}`,
+    );
     const producer = roomRouter.producers.get(producerId);
     if (!producer) {
       this.logger.warn(`Producer not found: ${producerId}`);
@@ -354,10 +483,7 @@ export class MediasoupService implements OnModuleInit {
     };
   }
 
-  async resumeConsumer(
-    roomId: string,
-    consumerId: string,
-  ): Promise<boolean> {
+  async resumeConsumer(roomId: string, consumerId: string): Promise<boolean> {
     const roomRouter = this.routers.get(roomId);
     if (!roomRouter) {
       this.logger.warn(`Router not found for room: ${roomId}`);
@@ -408,7 +534,9 @@ export class MediasoupService implements OnModuleInit {
   }
 
   cleanupUserMedia(roomId: string, oldSocketId: string): string[] {
-    this.logger.log(`[CLEANUP] 🧹 Starting media cleanup for room ${roomId}, oldSocket ${oldSocketId}`);
+    this.logger.log(
+      `[CLEANUP] 🧹 Starting media cleanup for room ${roomId}, oldSocket ${oldSocketId}`,
+    );
     const roomRouter = this.routers.get(roomId);
     if (!roomRouter) {
       this.logger.warn(`[CLEANUP] ⚠️  Room router not found for ${roomId}`);
@@ -421,34 +549,44 @@ export class MediasoupService implements OnModuleInit {
     const transportsToDelete: string[] = [];
     roomRouter.transports.forEach((transport, transportId) => {
       if (transportId.startsWith(oldSocketId)) {
-        this.logger.log(`[CLEANUP] 🚗 Closing transport for reconnected user: ${transportId}`);
+        this.logger.log(
+          `[CLEANUP] 🚗 Closing transport for reconnected user: ${transportId}`,
+        );
         transport.close();
         transportsToDelete.push(transportId);
       }
     });
-    transportsToDelete.forEach(id => roomRouter.transports.delete(id));
+    transportsToDelete.forEach((id) => roomRouter.transports.delete(id));
 
     // Note: Producers are stored by mediasoup ID, not socket ID
     // We can't easily identify which producers belong to which user
     // So we'll close ALL producers when host reconnects (they'll recreate them)
     if (transportsToDelete.length > 0) {
       roomRouter.producers.forEach((producer, producerId) => {
-        this.logger.log(`[CLEANUP] 🎬 Closing producer due to user reconnect: ${producerId}`);
+        this.logger.log(
+          `[CLEANUP] 🎬 Closing producer due to user reconnect: ${producerId}`,
+        );
         producer.close();
         closedProducerIds.push(producerId);
       });
       roomRouter.producers.clear();
     }
 
-    this.logger.log(`[CLEANUP] ✅ Cleaned up ${transportsToDelete.length} transports and ${closedProducerIds.length} producers for reconnected user in room ${roomId}`);
+    this.logger.log(
+      `[CLEANUP] ✅ Cleaned up ${transportsToDelete.length} transports and ${closedProducerIds.length} producers for reconnected user in room ${roomId}`,
+    );
     return closedProducerIds;
   }
 
   closeRoom(roomId: string): void {
-    this.logger.log(`[CLOSE-ROOM] 🗑️  Starting room cleanup for ${roomId}`);
+    this.logger.log(
+      `[CLOSE-ROOM] 🗑️  Starting room cleanup for ${roomId}. Current total rooms: ${this.routers.size}`,
+    );
     const roomRouter = this.routers.get(roomId);
     if (!roomRouter) {
-      this.logger.warn(`[CLOSE-ROOM] ⚠️  Room router not found for ${roomId}`);
+      this.logger.warn(
+        `[CLOSE-ROOM] ⚠️  Room router not found for ${roomId}. Available rooms: ${Array.from(this.routers.keys()).join(', ') || 'none'}`,
+      );
       return;
     }
 
@@ -473,8 +611,13 @@ export class MediasoupService implements OnModuleInit {
 
     // Close router
     roomRouter.router.close();
-    this.routers.delete(roomId);
+    const deleted = this.routers.delete(roomId);
 
-    this.logger.log(`[CLOSE-ROOM] ✅ Room ${roomId} fully closed (consumers: ${consumerCount}, producers: ${producerCount}, transports: ${transportCount})`);
+    this.logger.log(
+      `[CLOSE-ROOM] ✅ Room ${roomId} ${deleted ? 'successfully deleted' : 'FAILED TO DELETE'} (consumers: ${consumerCount}, producers: ${producerCount}, transports: ${transportCount}). Remaining rooms: ${this.routers.size}`,
+    );
+
+    // Trigger immediate auto-scaling check (scale down if needed)
+    void this.checkAndScale();
   }
 }

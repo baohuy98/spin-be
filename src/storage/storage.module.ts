@@ -20,4 +20,4 @@ import { JsonStorageService } from './services/json-storage.service';
   ],
   exports: [STORAGE_SERVICE],
 })
-export class StorageModule { }
+export class StorageModule {}
